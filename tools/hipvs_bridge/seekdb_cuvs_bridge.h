@@ -12,8 +12,8 @@ int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
 
 /* Build-once / search-many (used by seekdb's ob_vsag_adaptor GPU path).
  *  - seekdb_cuvs_build: builds a CAGRA index on the GPU from base (n x dim,
- *    row-major f32) and returns an opaque handle (NULL on error). cuVS copies
- *    the dataset to the device, so `base` may be freed after this returns.
+ *    row-major f32) and returns an opaque handle (NULL on error). The bridge or
+ *    cuVS owns the device copy, so `base` may be freed after this returns.
  *  - seekdb_cuvs_search: runs top-k search for nq queries (row-major f32, dim
  *    cols), writing uint32 row offsets to out_ids[nq*topk] and (if non-NULL) L2
  *    distances to out_dist[nq*topk]. Returns 0 on success.

@@ -10,16 +10,21 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
   cuvsCagraIndex_t       idx;
+  float*                base_device; /* owned; idx may hold a non-owning view */
   long n, dim;
 } sk_cuvs_index;
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
+  if (!base || n <= 0 || dim <= 0 ||
+      (size_t)n > SIZE_MAX / sizeof(float) / (size_t)dim) return NULL;
+  const size_t base_bytes = (size_t)n * (size_t)dim * sizeof(float);
   sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(*h));
   if (!h) return NULL;
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
@@ -31,7 +36,19 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.dtype.code = kDLFloat; dset.dl_tensor.dtype.bits = 32; dset.dl_tensor.dtype.lanes = 1;
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
-  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
+  /* With 16-byte-aligned rows, cuVS retains a view of device input instead of
+   * copying it again for the final index. NN-descent and graph sorting also
+   * consume this device input, avoiding their repeated host-to-device loads.
+   * Keep the allocation until after idx is destroyed. Unaligned rows retain
+   * the original host path, where cuVS owns its padded device dataset. */
+  if ((dim % 4) == 0) {
+    if (cudaMalloc((void**)&h->base_device, base_bytes) != cudaSuccess) goto fail_base;
+    if (cudaMemcpy(h->base_device, base, base_bytes, cudaMemcpyDefault) != cudaSuccess) goto fail_base;
+    dset.dl_tensor.data = h->base_device;
+    dset.dl_tensor.device.device_type = kDLCUDA;
+  }
+
+  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_base;
   h->ip->build_algo = NN_DESCENT;
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 256;
@@ -41,9 +58,10 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->n = n; h->dim = dim;
   return h;
 
-fail_idx: cuvsCagraIndexDestroy(h->idx);
+fail_idx: (void)cuvsStreamSync(h->res); cuvsCagraIndexDestroy(h->idx);
 fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
-fail_res: cuvsResourcesDestroy(h->res); free(h);
+fail_base: if (h->base_device) cudaFree(h->base_device);
+  cuvsResourcesDestroy(h->res); free(h);
   fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
   return NULL;
 }
@@ -91,7 +109,9 @@ void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  (void)cuvsStreamSync(h->res);
   cuvsCagraIndexDestroy(h->idx);
+  if (h->base_device) cudaFree(h->base_device);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
   free(h);
