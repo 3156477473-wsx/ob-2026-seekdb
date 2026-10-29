@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-typedef enum { kDLCPU = 1, kDLCUDA = 2 } DLDeviceType;
+typedef enum { kDLCPU = 1, kDLCUDA = 2, kDLROCM = 10 } DLDeviceType;
 typedef struct { DLDeviceType device_type; int32_t device_id; } DLDevice;
 typedef struct { uint8_t code, bits; uint16_t lanes; } DLDataType;
 typedef struct {

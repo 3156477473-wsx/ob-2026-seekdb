@@ -25,6 +25,13 @@ int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 void  seekdb_cuvs_free(void* handle);
 int seekdb_cuvs_serialize(void* handle, const char* filename);
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
+/* Restore the exact row-major FP32 CPU buffer from a live CAGRA dataset.
+ * out_base must hold n*dim floats. Padded row strides are supported; other
+ * layouts/devices and any metadata, synchronization or copy error fail.
+ * The caller must exclude concurrent calls/free on handle, as for serialize.
+ * A nonzero result may leave a partial output: never publish it on failure.
+ * The borrowed DLPack view is released here; the index keeps its GPU data. */
+int seekdb_cuvs_copy_dataset(void* handle, float* out_base, long n, long dim);
 #ifdef __cplusplus
 }
 #endif

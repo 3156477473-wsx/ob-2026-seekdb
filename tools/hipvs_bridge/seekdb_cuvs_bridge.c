@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -161,6 +162,69 @@ fail:
   fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
   free(index);
   return NULL;
+}
+
+int seekdb_cuvs_copy_dataset(void* handle, float* out_base, long n, long dim)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  if (!h || !out_base || n <= 0 || dim <= 0 || h->n != n || h->dim != dim ||
+      (size_t)n > SIZE_MAX / sizeof(float) / (size_t)dim) return 1;
+  DLManagedTensor view;
+  memset(&view, 0, sizeof(view));
+  int rc = 2;
+  do {
+    if (cuvsCagraIndexGetDataset(h->idx, &view) != CUVS_SUCCESS) break;
+    rc = 3;
+    const DLTensor* t = &view.dl_tensor;
+    /* The CUDA-compatibility fork may retain the CUDA DLPack tag on HIP.
+     * HIP also understands an explicitly tagged ROCm device allocation. */
+    const int gpu_device = t->device.device_type == kDLCUDA
+#ifdef __HIP_PLATFORM_AMD__
+        || t->device.device_type == kDLROCM
+#endif
+        ;
+    if (!view.deleter || !t->data || t->ndim != 2 || !t->shape ||
+        t->shape[0] != n || t->shape[1] != dim ||
+        t->dtype.code != kDLFloat || t->dtype.bits != 32 || t->dtype.lanes != 1 ||
+        !gpu_device || t->device.device_id < 0) break;
+    const int64_t stride = t->strides ? t->strides[0] : (int64_t)dim;
+    if ((t->strides && t->strides[1] != 1) || stride < dim ||
+        (uint64_t)stride > SIZE_MAX / sizeof(float) || t->byte_offset > SIZE_MAX) break;
+    const size_t row_bytes = (size_t)dim * sizeof(float);
+    const size_t row_pitch = (size_t)stride * sizeof(float);
+    if ((size_t)(n - 1) > (SIZE_MAX - row_bytes) / row_pitch) break;
+    const size_t source_span = (size_t)(n - 1) * row_pitch + row_bytes;
+    const size_t offset = (size_t)t->byte_offset;
+    const uintptr_t address = (uintptr_t)t->data;
+    if (address > UINTPTR_MAX - offset ||
+        address + offset > UINTPTR_MAX - (source_span - 1)) break;
+    const unsigned char* source = (const unsigned char*)t->data + offset;
+    rc = 4;
+    if (cuvsStreamSync(h->res) != CUVS_SUCCESS) break;
+    rc = 5;
+    if (row_pitch == row_bytes) {
+      if (cudaMemcpy(out_base, source, (size_t)n * row_bytes,
+                     cudaMemcpyDeviceToHost) != cudaSuccess) break;
+    } else {
+      /* CAGRA may pad unaligned rows. Copy only logical columns, preserving
+       * FP32 bits without treating padding as the next vector's contents. */
+      int failed = 0;
+      for (size_t row = 0; row < (size_t)n; ++row) {
+        if (cudaMemcpy(out_base + row * (size_t)dim, source + row * row_pitch,
+                       row_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+          failed = 1;
+          break;
+        }
+      }
+      if (failed) break;
+    }
+    rc = 0;
+  } while (0);
+  /* GetDataset owns the view metadata; its deleter does not own GPU data.
+   * Also release a partial view if the fixed C API reports an error. */
+  if (view.deleter) view.deleter(&view);
+  if (rc) fprintf(stderr, "[seekdb_cuvs] dataset restore rc=%d: %s\n", rc, cuvsGetLastErrorText());
+  return rc;
 }
 
 int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,

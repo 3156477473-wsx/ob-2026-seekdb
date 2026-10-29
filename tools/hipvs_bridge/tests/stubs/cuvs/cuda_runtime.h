@@ -1,7 +1,7 @@
 #pragma once
 #include <stddef.h>
 typedef int cudaError_t;
-enum { cudaSuccess = 0, cudaErrorUnknown = 1, cudaMemcpyDefault = 4 };
+enum { cudaSuccess = 0, cudaErrorUnknown = 1, cudaMemcpyDeviceToHost = 2, cudaMemcpyDefault = 4 };
 #ifdef __cplusplus
 extern "C" {
 #endif
