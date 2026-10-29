@@ -118,7 +118,7 @@ cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
 {
   assert(r && p && i == active_index && t); ++build_calls;
   assert(p->build_algo == NN_DESCENT && p->graph_degree == 128 &&
-         p->intermediate_graph_degree == 192 && p->nn_descent_niter == 100);
+         p->intermediate_graph_degree == 160 && p->nn_descent_niter == 100);
   DLTensor *d = &t->dl_tensor;
   assert(d->ndim == 2 && d->shape[0] == expected_n && d->shape[1] == expected_dim);
   assert(d->dtype.code == kDLFloat && d->dtype.bits == 32 && d->dtype.lanes == 1);

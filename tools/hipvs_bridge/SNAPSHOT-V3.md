@@ -6,4 +6,4 @@ The new reader accepts both `OBCUVS02` and `OBCUVS03`. Old binaries cannot read 
 
 The ELF and bridge must be built together: the new ELF requires the bridge's `seekdb_cuvs_copy_dataset` symbol. Old experiment bridge libraries do not implement that ABI.
 
-Source review and an exported SDK symbol check are complete. Native compilation, real-GPU copy verification and SQL persistence/performance validation must be completed before this change is accepted. Development measurements are not official scores.
+The default NN-descent intermediate graph degree is 160, with final degree 128, iteration cap 100 and query settings unchanged. The 60a native host with this exact bridge configuration passed full 250K/4096-query Gaussian tests at dimensions 128 and 256, Recall/query checks, sampled VRAM against a measured frozen V5 reference, and normal reopen checks. Native V3 copy tests also verified FP32 bits at dimensions 128, 256 and 129. The final integrated commit still requires its own build and public-SIFT verification. Development measurements are not official scores.
