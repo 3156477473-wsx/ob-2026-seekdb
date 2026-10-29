@@ -1,5 +1,38 @@
 # CAGRA intermediate graph degree 192
 
+## Controlled-pair correction
+
+The original 2.901x screen below did not control the reference process's OpenMP
+settings and must not be attributed to graph degree alone. The reference's
+actual runtime thread count was not captured. A later probe found the notebook's
+exported OMP_NUM_THREADS unset, despite a shell variable displaying 1; the SDK
+runtime defaulted to 128 threads in that probe. This does not establish the old
+process's exact runtime count. The statement that it inherited OMP_NUM_THREADS=1
+is withdrawn. Historical raw records are retained.
+
+Both processes in these replacement pairs explicitly used OMP_NUM_THREADS=16,
+OPENBLAS_NUM_THREADS=1, MKL_NUM_THREADS=1, 16-CPU quota and 8 GiB seekdb memory:
+
+| Controlled measurement | 128 dimensions | 256 dimensions |
+| --- | ---: | ---: |
+| f677 DDL plus first legal query | 20.905244 s | 26.216285 s |
+| graph192 DDL plus first legal query | 17.903806 s | 20.189203 s |
+| Build speedup relative to f677 | 1.167642x | 1.298530x |
+| Top-10 QPS ratio | 1.096072x | 1.028505x |
+| Top-100 QPS ratio | 1.036249x | 1.044284x |
+| Recall@10 delta | +0.001025 | +0.000171 |
+| Recall@100 delta | +0.002695 | +0.003420 |
+
+Both pairs used 250K seeded Gaussian FP32 vectors, 4096 queries per K, the same
+SQL settings, fresh database directories, and exhaustive float64 ground truth
+outside timing. Graph192 was 5f14b7d9df2cfcdd9f0e80994aa0b2dc1d1cf148. These
+measurements do not test the later CPU-budget policy. IDs/counts/uniqueness and
+eight ordered-result statements after normal reopen passed. The 256-D driver's
+final stop monitor encountered an exiting-process cmdline race; its original
+failure is retained, and a separate read-only reconciliation verified all its
+recorded processes absent or zombies. The corrected 128-D driver completed all
+normal stops. Neither pair is official SIFT/Hidden or an official score.
+
 This change builds on accepted candidate
 `f677a5d8ea2ea49aa8cdc354dfe8048e3fb50f16`, retaining its device-input lifetime
 and persistent query worker improvements. It changes only the CAGRA
@@ -11,7 +44,7 @@ The smaller intermediate graph reduces NN-descent host graph maintenance and
 CAGRA sorting/pruning work. This is a static construction parameter, applied to
 every build; there is no dataset, benchmark-phase or environment selector.
 
-## Real AMD development measurement
+## Historical parameter screen, thread conditions not controlled
 
 Environment: AMD gfx1100, ROCm 7.2.4, 16 CPU quota, seekdb memory budget 8 GiB.
 Both runs used the same full seekdb build and independently compiled bridge,

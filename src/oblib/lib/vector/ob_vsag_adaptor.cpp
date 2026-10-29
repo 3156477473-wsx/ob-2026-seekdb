@@ -32,6 +32,12 @@
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
+#if defined(OB_BUILD_CUVS) && defined(__linux__)
+#include <dlfcn.h>
+#include <sched.h>
+#endif
+#include "lib/cpu/ob_cpu_topology.h"
+#include "lib/utility/cgroup_cpu_quota.h"
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -132,16 +138,163 @@ static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) 
   (void)fn; (void)h; (void)a; (void)b;
 #endif
 }
+// One process-lifetime policy for the already loaded SDK libomp. The policy and
+// its NOLOAD reference intentionally outlive registry shared_ptr deleters.
+struct CuvsOmpPolicy {
+  using Getter = int (*)();
+  using Setter = void (*)(int);
+  using Defaults = void (*)(const char *);
+  std::once_flag once_;
+  void *handle_ = nullptr;
+  Getter get_ = nullptr;
+  Setter set_ = nullptr;
+  int budget_ = 0;
+  int64_t quota_ = 0;
+  int64_t configured_ = 0;
+  int64_t affinity_ = 0;
+  bool defaults_applied_ = false;
+  const char *runtime_ = nullptr;
+  const char *reason_ = "unsupported build/platform";
+
+  void initialize() {
+#if defined(OB_BUILD_CUVS) && defined(__linux__) && defined(_GNU_SOURCE) && defined(RTLD_NOLOAD)
+    do {
+      // Dependency-scoped lookup excludes the executable's static libgomp.
+      handle_ = ::dlopen("libseekdb_cuvs_bridge.so", RTLD_LAZY | RTLD_NOLOAD);
+      if (handle_ == nullptr) { reason_ = "loaded bridge unavailable"; break; }
+      Getter get = reinterpret_cast<Getter>(::dlsym(handle_, "omp_get_max_threads"));
+      Setter set = reinterpret_cast<Setter>(::dlsym(handle_, "omp_set_num_threads"));
+      void *fork = ::dlsym(handle_, "__kmpc_fork_call");
+      Dl_info get_info = {}, set_info = {}, fork_info = {};
+      if (get == nullptr || set == nullptr || fork == nullptr ||
+          ::dladdr(reinterpret_cast<void *>(get), &get_info) == 0 ||
+          ::dladdr(reinterpret_cast<void *>(set), &set_info) == 0 ||
+          ::dladdr(fork, &fork_info) == 0 || get_info.dli_fname == nullptr ||
+          get_info.dli_fbase != set_info.dli_fbase || get_info.dli_fbase != fork_info.dli_fbase) {
+        reason_ = "SDK OpenMP symbols absent or from different objects"; break;
+      }
+      const char *name = ::strrchr(get_info.dli_fname, '/');
+      name = name == nullptr ? get_info.dli_fname : name + 1;
+      if (::strncmp(name, "libomp.so", 9) != 0 || (name[9] != '\0' && name[9] != '.')) {
+        reason_ = "SDK runtime is not libomp"; break;
+      }
+      // A globally interposed fork entry could execute a different runtime even
+      // when dependency-scoped getters look correct. Reject that ambiguity.
+      void *global_fork = ::dlsym(RTLD_DEFAULT, "__kmpc_fork_call");
+      Dl_info global_fork_info = {};
+      if (global_fork == nullptr || ::dladdr(global_fork, &global_fork_info) == 0 ||
+          global_fork_info.dli_fbase != get_info.dli_fbase) {
+        reason_ = "global SDK fork binding absent/mismatched; policy unchanged"; break;
+      }
+      get_ = get; set_ = set; runtime_ = get_info.dli_fname;
+      quota_ = get_cgroup_cpu_quota_threads("/proc/thread-self/cgroup", "/proc/self/mountinfo");
+      configured_ = get_cpu_count();
+      cpu_set_t mask;
+      CPU_ZERO(&mask);
+      if (::sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) { if (CPU_ISSET(cpu, &mask)) { ++affinity_; } }
+      }
+      // Freeze a conservative startup budget. An unknown source never permits
+      // host-wide expansion, and this once-only policy is not a quota updater.
+      if (quota_ <= 0 || configured_ <= 0 || affinity_ <= 0) {
+        reason_ = "unknown quota/configured/affinity; policy unchanged"; break;
+      }
+      budget_ = static_cast<int>(std::min<int64_t>(std::numeric_limits<int>::max(),
+          std::min(quota_, std::min(configured_, affinity_))));
+      Defaults defaults = reinterpret_cast<Defaults>(::dlsym(handle_, "kmpc_set_defaults"));
+      Dl_info defaults_info = {};
+      if (defaults == nullptr || ::dladdr(reinterpret_cast<void *>(defaults), &defaults_info) == 0 ||
+          defaults_info.dli_fbase != get_info.dli_fbase) {
+        reason_ = "kmpc_set_defaults absent/mismatched; task-scope fallback only"; break;
+      }
+      char setting[64] = {};
+      const int written = ::snprintf(setting, sizeof(setting), "OMP_NUM_THREADS=%d", budget_);
+      if (written <= 0 || written >= static_cast<int>(sizeof(setting))) {
+        reason_ = "default setting formatting failed; task-scope fallback only"; break;
+      }
+      // This is the verified C char-const* ABI, not the Fortran kmp_set_defaults.
+      // No SDK entry can pass call_once until this one global update completes.
+      defaults(setting);
+      defaults_applied_ = true;
+      reason_ = "process defaults configured once before first SDK entry";
+    } while (false);
+    if (get_ == nullptr && handle_ != nullptr) {
+      ::dlclose(handle_); handle_ = nullptr;
+    }
+    const int current_threads = get_ == nullptr || budget_ <= 0 ? 0 : get_();
+    LOG_INFO("[OBVSAG][cuVS] process OpenMP policy", K(quota_), K(configured_), K(affinity_),
+             K(budget_), K(defaults_applied_), K(reason_), K(current_threads),
+             "runtime", runtime_ == nullptr ? "" : runtime_);
+#endif
+  }
+};
+
+static CuvsOmpPolicy &ob_cuvs_omp_policy() {
+  // The pointer has trivial static destruction. Never destroy the once_flag,
+  // cached functions, or retained dependency handle before registry teardown.
+  static CuvsOmpPolicy *const policy = new CuvsOmpPolicy();
+  std::call_once(policy->once_, [](CuvsOmpPolicy *p) { p->initialize(); }, policy);
+  return *policy;
+}
+
+// Existing workers can retain old root-task ICVs. Configure each SDK call's task
+// after ensure_policy, restoring only that task ICV, never process defaults.
+class CuvsSdkOmpScope {
+public:
+  CuvsSdkOmpScope() : set_(nullptr), previous_(0) {
+    CuvsOmpPolicy &policy = ob_cuvs_omp_policy();
+    if (policy.get_ == nullptr || policy.set_ == nullptr || policy.budget_ <= 0) { return; }
+    previous_ = policy.get_();
+    if (previous_ <= 0) { previous_ = 0; return; }
+    set_ = policy.set_;
+    set_(policy.budget_);
+  }
+  ~CuvsSdkOmpScope() { if (set_ != nullptr && previous_ > 0) { set_(previous_); } }
+  CuvsSdkOmpScope(const CuvsSdkOmpScope &) = delete;
+  CuvsSdkOmpScope &operator=(const CuvsSdkOmpScope &) = delete;
+private:
+  CuvsOmpPolicy::Setter set_;
+  int previous_;
+};
+
+static void *ob_cuvs_build_budgeted(const float *base, long n, long dim) {
+  CuvsSdkOmpScope omp_scope;
+  return seekdb_cuvs_build(base, n, dim);
+}
+static int ob_cuvs_search_budgeted(void *handle, const float *query, long nq, long topk,
+                                   unsigned int *out_ids, float *out_dist) {
+  CuvsSdkOmpScope omp_scope;
+  return seekdb_cuvs_search(handle, query, nq, topk, out_ids, out_dist);
+}
+static void ob_cuvs_free_budgeted(void *handle) {
+  if (handle == nullptr) { return; } // A no-op must not consume first-use policy.
+  CuvsSdkOmpScope omp_scope;
+  seekdb_cuvs_free(handle);
+}
+static int ob_cuvs_serialize_budgeted(void *handle, const char *path) {
+  CuvsSdkOmpScope omp_scope;
+  return seekdb_cuvs_serialize(handle, path);
+}
+static void *ob_cuvs_deserialize_budgeted(const char *path, long n, long dim) {
+  CuvsSdkOmpScope omp_scope;
+  return seekdb_cuvs_deserialize(path, n, dim);
+}
+static int ob_cuvs_cagra_knn_budgeted(const float *base, long n, long dim,
+                                     const float *query, long nq, long topk, unsigned int *out_ids) {
+  CuvsSdkOmpScope omp_scope;
+  return seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids);
+}
 static std::shared_ptr<void> ob_cuvs_wrap(void *handle) {
   if (handle == nullptr) { return std::shared_ptr<void>(); }
-  return std::shared_ptr<void>(handle, [](void *h) { seekdb_cuvs_free(h); });
+  return std::shared_ptr<void>(handle, [](void *h) { ob_cuvs_free_budgeted(h); });
 }
+
 struct ObCuvsBuildJob {
   const float *base; long n; long dim; void *out;
 };
 static void *ob_cuvs_build_job(void *arg) {
   ObCuvsBuildJob *j = static_cast<ObCuvsBuildJob *>(arg);
-  j->out = seekdb_cuvs_build(j->base, j->n, j->dim);
+  j->out = ob_cuvs_build_budgeted(j->base, j->n, j->dim);
   return nullptr;
 }
 // cuVS overflows the small OB worker/DDL stack, so builds run on a 32MB pthread.
@@ -204,7 +357,7 @@ struct ObCuvsJob {
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
   if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
+    void *nb = ob_cuvs_build_budgeted(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
     if (nb != nullptr) {
       j->ent->bridge_ = ob_cuvs_wrap(nb); j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
@@ -216,7 +369,7 @@ static void *ob_cuvs_job(void *arg) {
   // caller falls back to CPU VSAG (which is always fresh). This also gives the
   // desired split: streaming delta -> VSAG, stable snapshot -> cuVS.
   if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    j->rc_ = seekdb_cuvs_search(j->ent->bridge_.get(), j->query, 1, j->topk,
+    j->rc_ = ob_cuvs_search_budgeted(j->ent->bridge_.get(), j->query, 1, j->topk,
                                 j->off->data(), j->dst->data());
   }
   return nullptr;
@@ -231,7 +384,7 @@ struct ObCuvsBatchJob {
 static void *ob_cuvs_batch_job(void *arg) {
   ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
   if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
+    void *nb = ob_cuvs_build_budgeted(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->ent->dim_));
     if (nb != nullptr) {
       j->ent->bridge_ = ob_cuvs_wrap(nb); j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
@@ -239,7 +392,7 @@ static void *ob_cuvs_batch_job(void *arg) {
     }
   }
   if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    if (seekdb_cuvs_search(j->ent->bridge_.get(), j->queries, j->nq, j->topk,
+    if (ob_cuvs_search_budgeted(j->ent->bridge_.get(), j->queries, j->nq, j->topk,
                            j->off, j->dst) == 0) { j->served_ = j->nq; }
   }
   return nullptr;
@@ -254,12 +407,12 @@ struct ObCuvsRawBatchJob {
 };
 static void *ob_cuvs_raw_batch_job(void *arg) {
   ObCuvsRawBatchJob *j = static_cast<ObCuvsRawBatchJob *>(arg);
-  void *h = seekdb_cuvs_build(j->base, j->n, j->dim);
+  void *h = ob_cuvs_build_budgeted(j->base, j->n, j->dim);
   if (h != nullptr) {
-    if (seekdb_cuvs_search(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) {
+    if (ob_cuvs_search_budgeted(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) {
       j->served_ = j->nq;
     }
-    seekdb_cuvs_free(h);
+    ob_cuvs_free_budgeted(h);
   }
   return nullptr;
 }
@@ -340,10 +493,10 @@ struct ObCuvsSnapshotJob {
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
   if (job->load_) {
-    job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
+    job->handle_ = ob_cuvs_deserialize_budgeted(job->path_, job->n_, job->dim_);
     job->rc_ = job->handle_ == nullptr ? -1 : 0;
   } else {
-    job->rc_ = seekdb_cuvs_serialize(job->handle_, job->path_);
+    job->rc_ = ob_cuvs_serialize_budgeted(job->handle_, job->path_);
   }
   return nullptr;
 }
@@ -2062,7 +2215,7 @@ int cuvs_cagra_knn(const float *base, long n, long dim,
                    const float *query, long nq, long topk, unsigned int *out_ids)
 {
   // Route to the hipVS/cuVS GPU backend (bridge .so). Returns 0 on success.
-  return ::seekdb_cuvs_cagra_knn(base, n, dim, query, nq, topk, out_ids);
+  return ob_cuvs_cagra_knn_budgeted(base, n, dim, query, nq, topk, out_ids);
 }
 
 // [hipVS/cuVS BATCH operator] Feed nq probe vectors (row-major, dim from the

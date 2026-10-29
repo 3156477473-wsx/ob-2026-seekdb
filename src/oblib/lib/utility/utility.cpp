@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX LIB
 
 #include "utility.h"
+#include "lib/utility/cgroup_cpu_quota.h"
 #include "dirent.h"
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -182,7 +183,8 @@ bool read_cgroup_paths(const char *cgroup_path,
                        char *cgroup_v1_path,
                        const int64_t cgroup_v1_path_size,
                        char *cgroup_v2_path,
-                       const int64_t cgroup_v2_path_size)
+                       const int64_t cgroup_v2_path_size,
+                       const char *controller = "memory")
 {
   bool found_path = false;
   FILE *file = fopen(cgroup_path, "r");
@@ -203,7 +205,7 @@ bool read_cgroup_paths(const char *cgroup_path,
           found_path = copy_path(
               group_path, cgroup_v2_path, cgroup_v2_path_size) || found_path;
         } else if ('/' == group_path[0] &&
-                   controller_list_contains(controllers, "memory")) {
+                   controller_list_contains(controllers, controller)) {
           found_path = copy_path(
               group_path, cgroup_v1_path, cgroup_v1_path_size) || found_path;
         }
@@ -218,7 +220,8 @@ void find_cgroup_mounts(const char *mountinfo_path,
                         const char *cgroup_v1_path,
                         const char *cgroup_v2_path,
                         CgroupMountInfo &cgroup_v1_mount,
-                        CgroupMountInfo &cgroup_v2_mount)
+                        CgroupMountInfo &cgroup_v2_mount,
+                        const char *controller = "memory")
 {
   FILE *file = fopen(mountinfo_path, "r");
   if (nullptr != file) {
@@ -251,7 +254,7 @@ void find_cgroup_mounts(const char *mountinfo_path,
                 root, mount_point, cgroup_v2_path, cgroup_v2_mount);
           } else if ('\0' != cgroup_v1_path[0] &&
                      0 == strcmp(file_system_type, "cgroup") &&
-                     controller_list_contains(super_options, "memory")) {
+                     controller_list_contains(super_options, controller)) {
             (void)init_cgroup_mount(
                 root, mount_point, cgroup_v1_path, cgroup_v1_mount);
           }
@@ -352,8 +355,103 @@ void update_cgroup_hierarchy_limit(const CgroupMountInfo &mount_info,
     }
   }
 }
+
+// CPU quota parsing is separate from the existing memory-limit reader.
+bool parse_cpu_positive_integer(const char *text, unsigned long long &value)
+{
+  char *end = nullptr;
+  errno = 0;
+  if (nullptr == text || text[0] < '0' || text[0] > '9') { return false; }
+  value = strtoull(text, &end, 10);
+  return errno == 0 && end != text && *end == '\0' && value > 0;
+}
+
+bool read_cpu_quota_file(const char *path, bool v2, int64_t &threads)
+{
+  FILE *file = fopen(path, "r");
+  char quota[64] = {0}, period[64] = {0}, extra = 0;
+  bool valid = file != nullptr;
+  if (valid) {
+    valid = v2 ? fscanf(file, "%63s %63s %c", quota, period, &extra) == 2
+               : fscanf(file, "%63s %c", quota, &extra) == 1;
+    fclose(file);
+  }
+  if (valid && !v2) {
+    char period_path[PATH_MAX] = {0};
+    const char *slash = strrchr(path, '/');
+    const int written = slash == nullptr ? -1 : snprintf(period_path, sizeof(period_path),
+        "%.*s/cpu.cfs_period_us", static_cast<int>(slash - path), path);
+    valid = written > 0 && written < static_cast<int>(sizeof(period_path));
+    file = valid ? fopen(period_path, "r") : nullptr;
+    valid = file != nullptr;
+    if (valid) {
+      valid = fscanf(file, "%63s %c", period, &extra) == 1;
+      fclose(file);
+    }
+  }
+  unsigned long long denominator = 0, numerator = 0;
+  if (valid) {
+    valid = parse_cpu_positive_integer(period, denominator);
+    if (valid && 0 == strcmp(quota, v2 ? "max" : "-1")) {
+      threads = 0; // Known unlimited at this hierarchy level.
+    } else if (valid && parse_cpu_positive_integer(quota, numerator)) {
+      const unsigned long long floor = numerator / denominator;
+      threads = floor == 0 ? 1 : (floor > static_cast<unsigned long long>(INT64_MAX)
+          ? INT64_MAX : static_cast<int64_t>(floor));
+    } else {
+      valid = false;
+    }
+  }
+  return valid;
+}
+
+int64_t read_cgroup_cpu_hierarchy(const CgroupMountInfo &mount, const char *group, bool v2)
+{
+  char current[PATH_MAX] = {0};
+  int64_t minimum = INT64_MAX;
+  if (!get_mounted_cgroup_path(mount, group, current, sizeof(current))) { return 0; }
+  for (;;) {
+    char path[PATH_MAX] = {0};
+    const int written = snprintf(path, sizeof(path), "%s%s/%s", mount.mount_point_,
+        0 == strcmp(current, "/") ? "" : current, v2 ? "cpu.max" : "cpu.cfs_quota_us");
+    int64_t threads = 0;
+    // Unknown/unreadable visible ancestors cannot authorize a larger team.
+    if (written <= 0 || written >= static_cast<int>(sizeof(path)) ||
+        !read_cpu_quota_file(path, v2, threads)) { return 0; }
+    if (threads > 0 && threads < minimum) { minimum = threads; }
+    if (0 == strcmp(current, "/")) { break; }
+    char *slash = strrchr(current, '/');
+    if (slash == nullptr || slash == current) { current[0] = '/'; current[1] = '\0'; }
+    else { *slash = '\0'; }
+  }
+  return minimum == INT64_MAX ? 0 : minimum;
+}
 } // namespace
 #endif
+
+int64_t get_cgroup_cpu_quota_threads(const char *proc_cgroup_path, const char *proc_mountinfo_path)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+  char v1[PATH_MAX] = {0}, v2[PATH_MAX] = {0};
+  if (proc_cgroup_path == nullptr || proc_mountinfo_path == nullptr ||
+      !read_cgroup_paths(proc_cgroup_path, v1, sizeof(v1), v2, sizeof(v2), "cpu")) { return 0; }
+  CgroupMountInfo mount_v1, mount_v2;
+  find_cgroup_mounts(proc_mountinfo_path, v1, v2, mount_v1, mount_v2, "cpu");
+  // In a hybrid hierarchy the CPU controller belongs to v1 or v2, not both.
+  if (v1[0] != '\0') {
+    if (!mount_v1.valid_) { set_default_cgroup_mount("/sys/fs/cgroup/cpu", mount_v1); }
+    return read_cgroup_cpu_hierarchy(mount_v1, v1, false);
+  }
+  if (v2[0] != '\0') {
+    if (!mount_v2.valid_) { set_default_cgroup_mount("/sys/fs/cgroup", mount_v2); }
+    return read_cgroup_cpu_hierarchy(mount_v2, v2, true);
+  }
+#else
+  (void)proc_cgroup_path;
+  (void)proc_mountinfo_path;
+#endif
+  return 0;
+}
 
 #if defined(__linux__) && !defined(__ANDROID__)
 int64_t get_cgroup_memory_limit(
