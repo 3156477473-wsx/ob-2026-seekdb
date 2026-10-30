@@ -26,6 +26,11 @@
 #include <limits>
 #include <exception>
 #include <unistd.h>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#endif
 #include <istream>
 #include <ostream>
 #include <algorithm>
@@ -491,7 +496,27 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '3'};
 static const char OB_CUVS_SNAPSHOT_MAGIC_V2[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
 struct ObCuvsSnapshotFile {
-  FILE *file_ = ::tmpfile();
+  static FILE *open_file() {
+#if defined(__linux__) && defined(SYS_memfd_create) && defined(MFD_CLOEXEC) && \
+    defined(O_CLOEXEC) && (defined(_GNU_SOURCE) || defined(_DEFAULT_SOURCE) || defined(_BSD_SOURCE))
+    // Keep the same path-based bridge I/O, using a new anonymous file each time.
+    const int fd = static_cast<int>(::syscall(SYS_memfd_create, "seekdb-cuvs-snapshot", MFD_CLOEXEC));
+    if (fd >= 0) {
+      char path[64] = {};
+      const int len = ::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+      const int probe = len > 0 && static_cast<size_t>(len) < sizeof(path)
+          ? ::open(path, O_RDWR | O_CLOEXEC) : -1;
+      if (probe >= 0 && ::close(probe) == 0) {
+        FILE *file = ::fdopen(fd, "w+b");
+        if (file != nullptr) { return file; } // FILE now owns fd.
+      }
+      ::close(fd); // Failed probe/fdopen: ownership never transferred. Do not retry close.
+    }
+#endif
+    // Old kernels, restricted /proc, resource failures and other platforms.
+    return ::tmpfile();
+  }
+  FILE *file_ = open_file();
   char path_[64] = {};
   ObCuvsSnapshotFile() {
     if (file_ != nullptr) {
@@ -506,6 +531,23 @@ struct ObCuvsSnapshotJob {
   const char *path_; void *handle_; long n_; long dim_; bool load_; int rc_;
   float *restore_base_;
 };
+#if defined(__linux__)
+struct ObCuvsSnapshotMapping {
+  void *view_;
+  size_t bytes_;
+  ObCuvsSnapshotMapping(FILE *file, size_t bytes)
+      : view_(::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, ::fileno(file), 0)), bytes_(bytes) {}
+  ~ObCuvsSnapshotMapping() { if (view_ != MAP_FAILED) { (void)::munmap(view_, bytes_); } }
+  bool close() {
+    if (view_ == MAP_FAILED) { return true; }
+    if (::munmap(view_, bytes_) != 0) { return false; }
+    view_ = MAP_FAILED;
+    return true;
+  }
+  ObCuvsSnapshotMapping(const ObCuvsSnapshotMapping &) = delete;
+  ObCuvsSnapshotMapping &operator=(const ObCuvsSnapshotMapping &) = delete;
+};
+#endif
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
   if (job->load_) {
@@ -605,15 +647,32 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
-  uint64_t remaining = graph_bytes;
-  while (remaining > 0) {
-    const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
-    if (::fread(chunk.data(), 1, bytes, graph.file_) != bytes || !ob_cuvs_write(out, chunk.data(), bytes)) {
-      ret = OB_ERR_UNEXPECTED;
-      return true;
+  bool streamed = false;
+#if defined(__linux__)
+  if (graph_bytes <= std::numeric_limits<size_t>::max()) {
+    ObCuvsSnapshotMapping mapping(graph.file_, static_cast<size_t>(graph_bytes));
+    if (mapping.view_ != MAP_FAILED) {
+      const bool written = ob_cuvs_write(out, mapping.view_, static_cast<size_t>(graph_bytes));
+      const bool unmapped = mapping.close();
+      if (!written || !unmapped) {
+        ret = OB_ERR_UNEXPECTED;
+        return true;
+      }
+      streamed = true;
     }
-    remaining -= bytes;
+  }
+#endif
+  if (!streamed) {
+    std::vector<char> chunk(65536);
+    uint64_t remaining = graph_bytes;
+    while (remaining > 0) {
+      const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
+      if (::fread(chunk.data(), 1, bytes, graph.file_) != bytes || !ob_cuvs_write(out, chunk.data(), bytes)) {
+        ret = OB_ERR_UNEXPECTED;
+        return true;
+      }
+      remaining -= bytes;
+    }
   }
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
            K(built), K(build_us), K(graph_bytes));
