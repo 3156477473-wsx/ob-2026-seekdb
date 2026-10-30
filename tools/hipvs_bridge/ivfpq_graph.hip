@@ -71,6 +71,30 @@ struct IvfObjects {
     index = nullptr; search = nullptr; build = nullptr;
   }
 };
+// Index storage uses the current default MR, independently of this handle.
+// Release training-only BLAS/workspace resources before starting the search pool.
+struct ScopedTrainingResource {
+  hipStream_t stream;
+  cuvsResources_t handle = 0;
+  explicit ScopedTrainingResource(hipStream_t s) : stream(s) {}
+  ScopedTrainingResource(const ScopedTrainingResource&) = delete;
+  ScopedTrainingResource& operator=(const ScopedTrainingResource&) = delete;
+  ~ScopedTrainingResource() { (void)finish(); }
+  bool start() {
+    return cuvsResourcesCreate(&handle) == CUVS_SUCCESS &&
+           cuvsStreamSet(handle, reinterpret_cast<cudaStream_t>(stream)) == CUVS_SUCCESS;
+  }
+  bool finish() {
+    if (!handle) return true;
+    bool ok = hipStreamSynchronize(stream) == hipSuccess;
+    const cuvsResources_t closing = handle;
+    handle = 0;
+    ok = (cuvsResourcesDestroy(closing) == CUVS_SUCCESS) && ok;
+    ok = (hipStreamSynchronize(stream) == hipSuccess) && ok;
+    if (!ok) fprintf(stderr, "[seekdb_cuvs] ivfpq training resource cleanup failed\n");
+    return ok;
+  }
+};
 // This scope owns only search temporaries. The training resource keeps its old MR.
 struct ScopedSearchPool {
   cuvsResources_t original;
@@ -406,8 +430,10 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   Timer timer;
   DeviceMemory upload, knn, graph, candidates, candidate_distances;
   DeviceMemory errors, counts, offsets, block_offsets, cursors, sources, incoming_ranks;
+  ScopedTrainingResource training{stream};
   IvfObjects ivf;
   StreamFence fence{stream};
+  if (!training.start()) return 1;
   float* dataset_ptr = static_cast<float*>(input.data);
   if (input.device.device_type == kDLCPU) {
     if (!upload.allocate(size_t(rows) * size_t(dim) * sizeof(float)) ||
@@ -440,8 +466,9 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
           input_degree, degree, rows, (long long)dim, ivf.build->n_lists);
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu internal_batch=%u batch_events=%u memory_info=%u\n",
           unsigned(SEEKDB_IVFPQ_INTERNAL_BATCH), unsigned(SEEKDB_IVFPQ_BATCH_EVENTS), unsigned(SEEKDB_IVFPQ_MEMORY_INFO));
-  if (cuvsIvfPqBuild(res, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
+  if (cuvsIvfPqBuild(training.handle, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
       !timer.report("pq_train_build", stream)) return 1;
+  if (!training.finish()) return 1;
   const unsigned batch = std::min(unsigned(SEEKDB_IVFPQ_BATCH), rows);
   const unsigned candidate_k = std::min(rows, std::max(input_degree + 1, input_degree * unsigned(SEEKDB_IVFPQ_REFINEMENT)));
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu candidate_k=%u shared_capacity=%u shared_bytes=%zu dtype=FP32\n",
