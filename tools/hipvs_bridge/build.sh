@@ -17,21 +17,41 @@ OUTPUT=${1:-$SCRIPT_DIR/libseekdb_cuvs_bridge.so}
   echo "libcuvs_c.so is missing under $HIPVS_ROOT/lib" >&2
   exit 2
 }
+for header in cuvs/neighbors/cagra.h cuvs/neighbors/ivf_pq.h; do
+  [[ -f "$HIPVS_ROOT/include/$header" ]] || {
+    echo "public hipVS C header is missing: $HIPVS_ROOT/include/$header" >&2
+    exit 2
+  }
+done
 
 mkdir -p "$(dirname "$OUTPUT")"
+OUTPUT_DIR=$(cd "$(dirname "$OUTPUT")" && pwd)
+OUTPUT="$OUTPUT_DIR/$(basename "$OUTPUT")"
+BUILD_DIR=$(mktemp -d "$OUTPUT_DIR/.seekdb-cuvs-bridge.XXXXXX")
+cleanup() {
+  rm -f -- "$BUILD_DIR/bridge.o" "$BUILD_DIR/graph.o" "$BUILD_DIR/libseekdb_cuvs_bridge.so"
+  rmdir -- "$BUILD_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+export TMPDIR="$BUILD_DIR"
+FLAGS=(-fPIC -O3 -std=c++17 -x hip -D__HIP_PLATFORM_AMD__
+       -I"$HIPVS_ROOT/include" -I"$ROCM_ROOT/include")
+
+"$HIPCC" "${FLAGS[@]}" \
+  -c "$SCRIPT_DIR/seekdb_cuvs_bridge.c" -o "$BUILD_DIR/bridge.o"
+"$HIPCC" "${FLAGS[@]}" \
+  -DSEEKDB_IVFPQ_PROBES=32 -DSEEKDB_IVFPQ_BATCH=1024 -DSEEKDB_IVFPQ_REFINEMENT=4 \
+  -DSEEKDB_IVFPQ_INTERNAL_BATCH=128 -DSEEKDB_IVFPQ_BATCH_EVENTS=0 -DSEEKDB_IVFPQ_MEMORY_INFO=1 \
+  -c "$SCRIPT_DIR/ivfpq_graph.hip" -o "$BUILD_DIR/graph.o"
 
 "$HIPCC" \
   -shared \
-  -fPIC \
-  -O2 \
-  -D__HIP_PLATFORM_AMD__ \
-  -I"$HIPVS_ROOT/include" \
-  -I"$ROCM_ROOT/include" \
-  "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+  "$BUILD_DIR/bridge.o" "$BUILD_DIR/graph.o" \
   -L"$HIPVS_ROOT/lib" \
   -Wl,-soname,libseekdb_cuvs_bridge.so \
   -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \
   -lcuvs_c \
-  -o "$OUTPUT"
+  -o "$BUILD_DIR/libseekdb_cuvs_bridge.so"
+mv -- "$BUILD_DIR/libseekdb_cuvs_bridge.so" "$OUTPUT"
 
 echo "built $OUTPUT"

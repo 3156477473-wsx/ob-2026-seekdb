@@ -16,10 +16,10 @@ $(OUT)/tmp:
 $(OUT)/test-query-worker: test_query_worker.cpp ../../../src/oblib/lib/vector/cuvs_query_worker.h | $(OUT)/tmp
 	$(CXX) $(CXXFLAGS) -std=c++17 $(HOST_FLAGS) -pthread $< -o "$@"
 
-$(OUT)/test-device-build-c: test_device_build_input.c ../seekdb_cuvs_bridge.c ../seekdb_cuvs_bridge.h $(FAKE_HEADERS) | $(OUT)/tmp
+$(OUT)/test-device-build-c: test_device_build_input.c ../seekdb_cuvs_bridge.c ../seekdb_cuvs_bridge.h ../ivfpq_graph.h $(FAKE_HEADERS) | $(OUT)/tmp
 	$(CC) $(CFLAGS) -std=c11 $(HOST_FLAGS) $(FAKE_FLAGS) $< -o "$@"
 
-$(OUT)/test-device-build-cpp: test_device_build_input.c ../seekdb_cuvs_bridge.c ../seekdb_cuvs_bridge.h $(FAKE_HEADERS) | $(OUT)/tmp
+$(OUT)/test-device-build-cpp: test_device_build_input.c ../seekdb_cuvs_bridge.c ../seekdb_cuvs_bridge.h ../ivfpq_graph.h $(FAKE_HEADERS) | $(OUT)/tmp
 	$(CXX) $(CXXFLAGS) -x c++ -std=c++17 $(HOST_FLAGS) $(FAKE_FLAGS) $< -o "$@"
 
 check: all

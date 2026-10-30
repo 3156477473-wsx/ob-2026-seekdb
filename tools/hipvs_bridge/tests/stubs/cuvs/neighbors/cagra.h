@@ -8,6 +8,8 @@ typedef struct {
   int64_t n, dim;
   float *dataset;
   int borrowed;
+  unsigned int *graph;
+  int borrowed_graph;
 } *cuvsCagraIndex_t;
 typedef struct { size_t itopk_size, search_width; } *cuvsCagraSearchParams_t;
 typedef struct { int type; uintptr_t addr; } cuvsFilter;

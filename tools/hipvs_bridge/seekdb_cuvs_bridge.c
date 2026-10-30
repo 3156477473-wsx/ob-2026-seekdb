@@ -1,5 +1,6 @@
 /* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here. */
 #include "seekdb_cuvs_bridge.h"
+#include "ivfpq_graph.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
 #include <dlpack/dlpack.h>
@@ -18,6 +19,7 @@ typedef struct {
   cuvsCagraIndexParams_t ip;
   cuvsCagraIndex_t       idx;
   float*                base_device; /* owned; idx may hold a non-owning view */
+  unsigned int*         graph_device; /* owned GPU graph; index borrows it */
   long n, dim;
 } sk_cuvs_index;
 
@@ -30,7 +32,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (!h) return NULL;
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
 
-  DLManagedTensor dset; long ds[2] = {n, dim};
+  DLManagedTensor dset; int64_t ds[2] = {n, dim};
   dset.dl_tensor.data = (void*)base;
   dset.dl_tensor.device.device_type = kDLCPU; dset.dl_tensor.device.device_id = 0;
   dset.dl_tensor.ndim = 2;
@@ -55,11 +57,16 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->intermediate_graph_degree = 160;
   h->ip->nn_descent_niter = 100;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+  /* Preserve native GPU construction when PQ training has too few samples
+   * or there are too few unique vertices for this intermediate degree. */
+  if (n < SEEKDB_IVFPQ_MIN_ROWS) {
+    if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+  } else if (seekdb_ivfpq_gpu_graph(h->res, h->ip, &dset, h->idx, &h->graph_device) != 0) goto fail_idx;
   h->n = n; h->dim = dim;
   return h;
 
 fail_idx: (void)cuvsStreamSync(h->res); cuvsCagraIndexDestroy(h->idx);
+  if (h->graph_device) cudaFree(h->graph_device);
 fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
 fail_base: if (h->base_device) cudaFree(h->base_device);
   cuvsResourcesDestroy(h->res); free(h);
@@ -79,7 +86,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   if (cuvsRMMAlloc(h->res, (void**)&dd, sizeof(float)*nq*topk)    != CUVS_SUCCESS) { rc=12; goto done; }
   if (cudaMemcpy(qd, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
   {
-    DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
+    DLManagedTensor qt, nt, dt; int64_t qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
     qt.dl_tensor.data=qd; qt.dl_tensor.device.device_type=kDLCUDA; qt.dl_tensor.device.device_id=0;
     qt.dl_tensor.ndim=2; qt.dl_tensor.dtype.code=kDLFloat; qt.dl_tensor.dtype.bits=32; qt.dl_tensor.dtype.lanes=1;
     qt.dl_tensor.shape=qs; qt.dl_tensor.strides=0; qt.dl_tensor.byte_offset=0;
@@ -112,6 +119,7 @@ void seekdb_cuvs_free(void* handle)
   if (!h) return;
   (void)cuvsStreamSync(h->res);
   cuvsCagraIndexDestroy(h->idx);
+  if (h->graph_device) cudaFree(h->graph_device);
   if (h->base_device) cudaFree(h->base_device);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);

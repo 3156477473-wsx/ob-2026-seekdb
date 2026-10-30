@@ -10,7 +10,8 @@
 #endif
 
 enum Fault { F_NONE, F_HOST_CALLOC, F_RESOURCE, F_MALLOC, F_COPY, F_PARAMS,
-             F_INDEX, F_BUILD, F_LOAD, F_GET_DATASET, F_SYNC };
+             F_INDEX, F_BUILD, F_LOAD, F_GET_DATASET, F_SYNC,
+             F_GRAPH_ALLOC, F_GRAPH_WORK, F_GRAPH_PUBLISHED };
 static enum Fault fault;
 static void *bridge_calloc(size_t n, size_t bytes)
 {
@@ -22,6 +23,7 @@ static void *bridge_calloc(size_t n, size_t bytes)
 
 static int resources, params, indexes, owned_datasets, allocations, frees, copies;
 static int build_calls, serialize_calls, load_calls, sync_calls, last_device;
+static int gpu_graph_calls, graph_was_published;
 static int operation_clock, last_sync, last_index_destroy, last_build;
 static int dataset_views, dataset_view_deletes, copy_fail_at;
 enum ViewFault { V_VALID, V_N, V_DIM, V_DTYPE, V_LANES, V_DEVICE, V_DEVICE_ID,
@@ -33,6 +35,7 @@ static uint64_t view_byte_offset;
 static int null_view_strides;
 static int rocm_view_device;
 static void *device_input;
+static unsigned int *device_graph;
 static size_t device_bytes;
 static cuvsCagraIndex_t active_index;
 static const float *expected;
@@ -40,7 +43,7 @@ static int64_t expected_n, expected_dim;
 
 static void no_live_resources(void)
 {
-  assert(!resources && !params && !indexes && !owned_datasets && !device_input && !dataset_views);
+  assert(!resources && !params && !indexes && !owned_datasets && !device_input && !device_graph && !dataset_views);
   assert(allocations == frees);
 }
 cudaError_t cudaMalloc(void **ptr, size_t bytes)
@@ -52,11 +55,16 @@ cudaError_t cudaMalloc(void **ptr, size_t bytes)
 }
 cudaError_t cudaFree(void *ptr)
 {
-  assert(ptr == device_input);
+  assert(ptr && (ptr == device_input || ptr == device_graph));
   /* Index must stop borrowing this buffer before the bridge frees it. */
-  assert(!active_index || active_index->dataset != ptr);
-  if (last_build) assert(last_index_destroy > last_build && last_sync > last_build);
-  free(ptr); device_input = NULL; device_bytes = 0; ++frees; return cudaSuccess;
+  assert(!active_index || ((void *)active_index->dataset != ptr && (void *)active_index->graph != ptr));
+  if (last_build) {
+    assert(last_sync > last_build);
+    if (ptr == device_input || graph_was_published) assert(last_index_destroy > last_build);
+  }
+  if (ptr == device_graph) { free(ptr); device_graph = NULL; }
+  else { free(ptr); device_input = NULL; device_bytes = 0; }
+  ++frees; return cudaSuccess;
 }
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t bytes, int kind)
 {
@@ -108,15 +116,17 @@ cuvsError_t cuvsCagraIndexDestroy(cuvsCagraIndex_t p)
 {
   assert(p == active_index);
   if (last_build) assert(last_sync > last_build);
+  if (p->borrowed_graph) assert(p->graph == device_graph);
+  else assert(!p->graph);
   if (p->borrowed) assert(p->dataset == device_input);
   else if (p->dataset) { free(p->dataset); --owned_datasets; }
   free(p); active_index = NULL; --indexes;
   last_index_destroy = ++operation_clock; return CUVS_SUCCESS;
 }
-cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
-                         DLManagedTensor *t, cuvsCagraIndex_t i)
+static void retain_dataset(cuvsResources_t r, cuvsCagraIndexParams_t p,
+                           DLManagedTensor *t, cuvsCagraIndex_t i)
 {
-  assert(r && p && i == active_index && t); ++build_calls;
+  assert(r && p && i == active_index && t);
   assert(p->build_algo == NN_DESCENT && p->graph_degree == 128 &&
          p->intermediate_graph_degree == 160 && p->nn_descent_niter == 100);
   DLTensor *d = &t->dl_tensor;
@@ -136,7 +146,37 @@ cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
   }
   /* Even the failing backend has retained a reference, exposing cleanup order. */
   last_build = ++operation_clock;
+}
+cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
+                         DLManagedTensor *t, cuvsCagraIndex_t i)
+{
+  ++build_calls;
+  retain_dataset(r, p, t, i);
   return fault == F_BUILD ? CUVS_ERROR : CUVS_SUCCESS;
+}
+/* Only an ownership fake: the actual GPU helper is never built or linked into
+ * these CPU tests. Distinct counters reject accidental native-path dispatch. */
+int seekdb_ivfpq_gpu_graph(cuvsResources_t r, cuvsCagraIndexParams_t p,
+                          DLManagedTensor *t, cuvsCagraIndex_t i,
+                          unsigned int **storage)
+{
+  assert(r && p && t && i == active_index && storage && !*storage && !device_graph);
+  assert(t->dl_tensor.shape[0] >= SEEKDB_IVFPQ_MIN_ROWS);
+  ++gpu_graph_calls; last_build = ++operation_clock;
+  if (fault == F_GRAPH_ALLOC) return 1;
+  device_graph = (unsigned int *)malloc((size_t)t->dl_tensor.shape[0] * 128 * sizeof(unsigned int));
+  assert(device_graph); ++allocations;
+  if (fault == F_GRAPH_WORK) {
+    /* Unpublished work is fenced and released inside the helper. */
+    assert(cuvsStreamSync(r) == CUVS_SUCCESS);
+    assert(cudaFree(device_graph) == cudaSuccess);
+    return 1;
+  }
+  retain_dataset(r, p, t, i);
+  i->graph = device_graph; i->borrowed_graph = 1;
+  *storage = device_graph; graph_was_published = 1;
+  /* Includes failure after FromArgs publishes borrowed graph/data references. */
+  return fault == F_BUILD || fault == F_GRAPH_PUBLISHED;
 }
 cuvsError_t cuvsCagraSerialize(cuvsResources_t r, const char *path,
                              cuvsCagraIndex_t i, bool include_dataset)
@@ -215,26 +255,30 @@ cuvsError_t cuvsCagraSearch(cuvsResources_t r, cuvsCagraSearchParams_t p,
 }
 
 static void reset_order(void)
-{ last_build = last_sync = last_index_destroy = operation_clock = 0; }
-static void success_case(long dim)
+{ last_build = last_sync = last_index_destroy = operation_clock = graph_was_published = 0; }
+static void success_case(long n, long dim)
 {
-  expected_n = 4; expected_dim = dim; fault = F_NONE; reset_order();
+  expected_n = n; expected_dim = dim; fault = F_NONE; reset_order();
   float *base = (float *)malloc((size_t)expected_n * (size_t)dim * sizeof(float)); assert(base);
   for (int64_t j = 0; j < expected_n * dim; ++j) base[j] = (float)j * 0.125f;
   expected = base;
-  int a = allocations, c = copies;
+  int a = allocations, c = copies, native_before = build_calls, gpu_before = gpu_graph_calls;
   void *h = seekdb_cuvs_build(base, (long)expected_n, dim); assert(h);
   assert(last_device == ((dim % 4) ? kDLCPU : kDLCUDA));
-  assert(allocations - a == ((dim % 4) ? 0 : 1));
+  assert(allocations - a == ((dim % 4) ? 0 : 1) + (n >= SEEKDB_IVFPQ_MIN_ROWS));
   assert(copies - c == ((dim % 4) ? 0 : 1));
   if (!(dim % 4)) assert(((sk_cuvs_index *)h)->base_device == device_input);
+  assert(build_calls - native_before == (n < SEEKDB_IVFPQ_MIN_ROWS));
+  assert(gpu_graph_calls - gpu_before == (n >= SEEKDB_IVFPQ_MIN_ROWS));
+  assert(((sk_cuvs_index *)h)->graph_device == device_graph);
+  assert(!!device_graph == (n >= SEEKDB_IVFPQ_MIN_ROWS));
   assert(seekdb_cuvs_serialize(h, "fake.snapshot") == 0);
   seekdb_cuvs_free(h); no_live_resources();
 
   /* Loaded indexes own their dataset through cuVS, never through base_device. */
   reset_order(); a = allocations; c = build_calls;
   h = seekdb_cuvs_deserialize("fake.snapshot", (long)expected_n, dim); assert(h);
-  assert(!((sk_cuvs_index *)h)->base_device && allocations == a && build_calls == c);
+  assert(!((sk_cuvs_index *)h)->base_device && !((sk_cuvs_index *)h)->graph_device && allocations == a && build_calls == c);
   assert(seekdb_cuvs_serialize(h, "fake.loaded") == 0);
   seekdb_cuvs_free(h); no_live_resources(); free(base); expected = NULL;
 }
@@ -305,7 +349,10 @@ static void dataset_restore_cases(int padded, int offset, int no_strides)
 }
 int main(void)
 {
-  success_case(128); success_case(256); success_case(129);
+  success_case(4, 128); success_case(4, 256); success_case(4, 129);
+  success_case(SEEKDB_IVFPQ_MIN_ROWS - 1, 128);
+  success_case(SEEKDB_IVFPQ_MIN_ROWS, 128);
+  success_case(256, 256); success_case(256, 129);
   dataset_restore_cases(0, 0, 0); dataset_restore_cases(1, 1, 0);
   dataset_restore_cases(0, 1, 1);
   float base[4 * 128] = {0}; expected = base; expected_n = 4; expected_dim = 128;
@@ -313,6 +360,20 @@ int main(void)
     fault = (enum Fault)f; reset_order();
     assert(!seekdb_cuvs_build(base, 4, 128)); no_live_resources();
   }
+  float *gpu_base = (float *)calloc((size_t)256 * 128, sizeof(float)); assert(gpu_base);
+  expected = gpu_base; expected_n = 256; expected_dim = 128;
+  for (int f = F_HOST_CALLOC; f <= F_BUILD; ++f) {
+    fault = (enum Fault)f; reset_order();
+    assert(!seekdb_cuvs_build(gpu_base, 256, 128)); no_live_resources();
+  }
+  const enum Fault graph_faults[] = {F_GRAPH_ALLOC, F_GRAPH_WORK, F_GRAPH_PUBLISHED};
+  for (size_t j = 0; j < sizeof(graph_faults) / sizeof(graph_faults[0]); ++j) {
+    fault = graph_faults[j]; reset_order();
+    int before = gpu_graph_calls;
+    assert(!seekdb_cuvs_build(gpu_base, 256, 128));
+    assert(gpu_graph_calls == before + 1); no_live_resources();
+  }
+  free(gpu_base); expected = base; expected_n = 4; expected_dim = 128;
   fault = F_LOAD; reset_order();
   assert(!seekdb_cuvs_deserialize("fake.snapshot", 4, 128)); no_live_resources();
   fault = F_NONE; reset_order();
@@ -325,7 +386,7 @@ int main(void)
   assert(!seekdb_cuvs_deserialize(NULL, 4, 128));
   seekdb_cuvs_free(NULL);
   assert(allocations == a && build_calls == b); no_live_resources();
-  printf("PASS CPU fake ownership: aligned128/256, unaligned129, build failures, reload, overflow; alloc/free=%d/%d build=%d serialize=%d load=%d sync=%d\n",
-         allocations, frees, build_calls, serialize_calls, load_calls, sync_calls);
+  printf("PASS CPU fake ownership: native/custom dispatch, aligned128/256, unaligned129, unpublished/published graph failures, reload, overflow; alloc/free=%d/%d native=%d custom=%d serialize=%d load=%d sync=%d\n",
+         allocations, frees, build_calls, gpu_graph_calls, serialize_calls, load_calls, sync_calls);
   return 0;
 }
