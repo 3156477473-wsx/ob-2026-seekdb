@@ -31,7 +31,7 @@
 #define SEEKDB_IVFPQ_BATCH 1024
 #endif
 #ifndef SEEKDB_IVFPQ_INTERNAL_BATCH
-#define SEEKDB_IVFPQ_INTERNAL_BATCH 256
+#define SEEKDB_IVFPQ_INTERNAL_BATCH 128
 #endif
 #ifndef SEEKDB_IVFPQ_INTERMEDIATE
 #define SEEKDB_IVFPQ_INTERMEDIATE 192
@@ -69,71 +69,6 @@ struct IvfObjects {
     if (search) cuvsIvfPqSearchParamsDestroy(search);
     if (build) cuvsIvfPqIndexParamsDestroy(build);
     index = nullptr; search = nullptr; build = nullptr;
-  }
-};
-// Index storage uses the current default MR, independently of this handle.
-// Release training-only BLAS/workspace resources before starting the search pool.
-struct ScopedTrainingResource {
-  hipStream_t stream;
-  cuvsResources_t handle = 0;
-  explicit ScopedTrainingResource(hipStream_t s) : stream(s) {}
-  ScopedTrainingResource(const ScopedTrainingResource&) = delete;
-  ScopedTrainingResource& operator=(const ScopedTrainingResource&) = delete;
-  ~ScopedTrainingResource() { (void)finish(); }
-  bool start() {
-    return cuvsResourcesCreate(&handle) == CUVS_SUCCESS &&
-           cuvsStreamSet(handle, reinterpret_cast<cudaStream_t>(stream)) == CUVS_SUCCESS;
-  }
-  bool finish() {
-    if (!handle) return true;
-    bool ok = hipStreamSynchronize(stream) == hipSuccess;
-    const cuvsResources_t closing = handle;
-    handle = 0;
-    ok = (cuvsResourcesDestroy(closing) == CUVS_SUCCESS) && ok;
-    ok = (hipStreamSynchronize(stream) == hipSuccess) && ok;
-    if (!ok) fprintf(stderr, "[seekdb_cuvs] ivfpq training resource cleanup failed\n");
-    return ok;
-  }
-};
-// This scope owns only search temporaries. The training resource keeps its old MR.
-struct ScopedSearchPool {
-  cuvsResources_t original;
-  hipStream_t stream;
-  cuvsResources_t search = 0;
-  bool enabled = false;
-  ScopedSearchPool(cuvsResources_t res, hipStream_t s) : original(res), stream(s) {}
-  ScopedSearchPool(const ScopedSearchPool&) = delete;
-  ScopedSearchPool& operator=(const ScopedSearchPool&) = delete;
-  ~ScopedSearchPool() { (void)finish(); }
-  bool start() {
-    if (cuvsRMMPoolMemoryResourceEnable(0, 1, false) != CUVS_SUCCESS) {
-      const char* error = cuvsGetLastErrorText();
-      fprintf(stderr, "[seekdb_cuvs] ivfpq search pool unavailable; using original resource: %s\n",
-              error ? error : "no SDK error text");
-      return true; // Do not reset or replace an existing upstream MR.
-    }
-    enabled = true;
-    // The training handle already cached its workspace MR. Use a fresh handle.
-    return cuvsResourcesCreate(&search) == CUVS_SUCCESS &&
-           cuvsStreamSet(search, reinterpret_cast<cudaStream_t>(stream)) == CUVS_SUCCESS;
-  }
-  cuvsResources_t resource() const { return enabled ? search : original; }
-  bool finish() {
-    if (!enabled) return true;
-    const char* error = cuvsGetLastErrorText();
-    if (error) fprintf(stderr, "[seekdb_cuvs] ivfpq pool cleanup after SDK error: %s\n", error);
-    bool ok = hipStreamSynchronize(stream) == hipSuccess;
-    if (search) {
-      const cuvsResources_t closing = search;
-      search = 0;
-      ok = (cuvsResourcesDestroy(closing) == CUVS_SUCCESS) && ok;
-    }
-    // Resource destruction may enqueue deallocation work on the borrowed stream.
-    ok = (hipStreamSynchronize(stream) == hipSuccess) && ok;
-    ok = (cuvsRMMMemoryResourceReset() == CUVS_SUCCESS) && ok;
-    enabled = false;
-    if (!ok) fprintf(stderr, "[seekdb_cuvs] ivfpq search pool cleanup failed\n");
-    return ok;
   }
 };
 struct Timer {
@@ -430,10 +365,8 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   Timer timer;
   DeviceMemory upload, knn, graph, candidates, candidate_distances;
   DeviceMemory errors, counts, offsets, block_offsets, cursors, sources, incoming_ranks;
-  ScopedTrainingResource training{stream};
   IvfObjects ivf;
   StreamFence fence{stream};
-  if (!training.start()) return 1;
   float* dataset_ptr = static_cast<float*>(input.data);
   if (input.device.device_type == kDLCPU) {
     if (!upload.allocate(size_t(rows) * size_t(dim) * sizeof(float)) ||
@@ -466,9 +399,8 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
           input_degree, degree, rows, (long long)dim, ivf.build->n_lists);
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu internal_batch=%u batch_events=%u memory_info=%u\n",
           unsigned(SEEKDB_IVFPQ_INTERNAL_BATCH), unsigned(SEEKDB_IVFPQ_BATCH_EVENTS), unsigned(SEEKDB_IVFPQ_MEMORY_INFO));
-  if (cuvsIvfPqBuild(training.handle, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
+  if (cuvsIvfPqBuild(res, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
       !timer.report("pq_train_build", stream)) return 1;
-  if (!training.finish()) return 1;
   const unsigned batch = std::min(unsigned(SEEKDB_IVFPQ_BATCH), rows);
   const unsigned candidate_k = std::min(rows, std::max(input_degree + 1, input_degree * unsigned(SEEKDB_IVFPQ_REFINEMENT)));
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu candidate_k=%u shared_capacity=%u shared_bytes=%zu dtype=FP32\n",
@@ -486,11 +418,6 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
       !errors.allocate(sizeof(unsigned)) ||
       hipMemsetAsync(errors.pointer, 0, sizeof(unsigned), stream) != hipSuccess ||
       !timer.start(stream)) return 1;
-  // FP32 coarse search uses the original index views, not mutable half/int8 caches.
-  if (ivf.search->coarse_search_dtype != HIP_R_32F ||
-      ivf.search->lut_dtype != HIP_R_32F || ivf.search->internal_distance_dtype != HIP_R_32F) return 1;
-  ScopedSearchPool search_pool{res, stream};
-  if (!search_pool.start()) return 1;
   for (unsigned offset = 0; offset < rows; offset += batch) {
     const unsigned count = std::min(batch, rows - offset);
     int64_t qs[2] = {count, dim}, cs[2] = {count, candidate_k};
@@ -501,7 +428,7 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
     auto& events = batch_events.values[offset / batch];
     if (hipEventRecord(events[0], stream) != hipSuccess) return 1;
 #endif
-    if (cuvsIvfPqSearch(search_pool.resource(), ivf.search, ivf.index, &queries, &neighbors, &distances) != CUVS_SUCCESS) return 1;
+    if (cuvsIvfPqSearch(res, ivf.search, ivf.index, &queries, &neighbors, &distances) != CUVS_SUCCESS) return 1;
 #if SEEKDB_IVFPQ_BATCH_EVENTS
     if (hipEventRecord(events[1], stream) != hipSuccess) return 1;
 #endif
@@ -523,7 +450,6 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
 #if SEEKDB_IVFPQ_BATCH_EVENTS
   if (!batch_events.report()) return 1;
 #endif
-  if (!search_pool.finish()) return 1;
   ivf.reset();
   candidates.reset(); candidate_distances.reset();
   if (!graph.allocate(size_t(rows) * degree * sizeof(unsigned)) || !timer.start(stream)) return 1;
