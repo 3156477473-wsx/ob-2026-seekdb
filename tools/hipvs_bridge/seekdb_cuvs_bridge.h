@@ -23,6 +23,9 @@ void* seekdb_cuvs_build(const float* base, long n, long dim);
 int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                          unsigned int* out_ids, float* out_dist);
 void  seekdb_cuvs_free(void* handle);
+/* Native persistence: SKCAGR04 LE header + exact uint32 graph/FP32 payload,
+ * bounded 8MiB host staging, corruption checksum. The reader also accepts
+ * legacy SDK snapshots. No query graph is rebuilt, reordered or converted. */
 int seekdb_cuvs_serialize(void* handle, const char* filename);
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
 /* Restore the exact row-major FP32 CPU buffer from a live CAGRA dataset.

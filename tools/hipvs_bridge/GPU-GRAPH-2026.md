@@ -34,26 +34,33 @@ does not replace the `lib=vsag` CPU implementation. The production build entry
 remains `bash tools/hipvs_bridge/build.sh [OUTPUT_SO]` and needs only the fixed
 SDK's public C headers and the installed ROCm toolchain, without new downloads.
 
-Before reserializing a reloaded index with 16-byte-aligned FP32 rows, the bridge
-copies the public dataset and graph views into its own `cudaMalloc` buffers and
-wraps the exact copied graph through `cuvsCagraIndexFromArgs(L2Expanded)`. Copies
-use explicit device-to-device direction, validate shapes, dtype, strides, byte
-offset and overflow, and finish before the old index is destroyed. The new index
-borrows both buffers until bridge destruction. This avoids an observed fixed-SDK
-reload/reserialize path that could return success while writing incorrect dataset
-bytes; synchronization alone did not consistently prevent it. It does not claim
-that the SDK's underlying defect has been identified.
+Native bridge snapshots now use a 64-byte little-endian `SKCAGR04` header,
+followed by the original uint32 graph rows and exact FP32 dataset bits. Header
+fields are magic8, version4:u32, L2Expanded metric:u32, then n, dim, degree,
+graphBytes, baseBytes and checksum:u64. The payload checksum starts at
+14695981039346656037 and, for each little-endian uint32 word in graph-then-data
+order, applies `(hash XOR word) * 1099511628211` modulo2^64. It detects accidental
+corruption; external receipts still use SHA256 for artifact identity.
 
-Fresh aligned builds already own their dataset and skip this copy, so their
-construction and first-serialization paths are unchanged. Unaligned dimensions
-retain their existing SDK serialization path: the public row-major `FromArgs`
-would introduce another SDK-owned padded dataset there. A failed replacement
-keeps the original index until the final destruction boundary; a destruction
-error invalidates the published handle rather than allowing a dangling index to
-be reused. Unknown failed-destructor storage is conservatively retained until
-process cleanup. The extra transient GPU storage is one logical FP32 dataset
-plus one uint32 graph, and SDK pool retention may increase the measured peak.
-New complete native-file/FP32, full SQL/reopen and VRAM validation is required.
+Saving obtains the public `GetGraph`/`GetDataset` views, validates shape, dtype,
+stride, byte offset and complete address/size bounds, and copies logical bytes
+using explicit device-to-host transfers through one reusable8MiB buffer. Dense
+views use large chunks; padded views copy logical row segments. Loading verifies
+header/caller dimensions, exact payload sizes, checksum, EOF and I/O completion,
+then copies chunks with explicit host-to-device transfers into bridge-owned GPU
+buffers and calls `IndexFromArgs(L2Expanded)` on the original graph. Both buffers
+outlive the index; no neighbors are rebuilt, reordered or substituted. Unaligned
+logical dimensions may receive the fixed library's internal padded copy, but the
+stream writer reads its logical view directly and never invokes SDK Serialize.
+
+This removes the failed clone-only workaround. Actual experiments found that
+both direct SDK reserialization and cudaMalloc rebinding could return success
+while writing incorrect graph/dataset bytes; synchronization alone was also
+insufficient. This does not identify the SDK/runtime defect's root cause. Files
+whose magic differs still use the unchanged SDK Deserialize reader, allowing old
+V2/V3 native payloads to be read and converted to the new format. The outer V3
+container, IDs and query implementation are unchanged. New complete-file SHA,
+FP32 bit equality, full SQL/reopen and VRAM results are required for this version.
 
 The build script explicitly selects the AMD platform and `gfx1100`, the
 competition's Radeon PRO W7900D target. Compiling on a host without a visible GPU

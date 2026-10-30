@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* Linux LP64 CPU fake: exercises the actual candidate C file, never HIP/ANN. */
 #include <assert.h>
 #include <limits.h>
@@ -5,6 +6,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <dirent.h>
 #if LONG_MAX != INT64_MAX
 #error This test requires Linux LP64; DLPack shape is int64_t, not a Windows long shim.
 #endif
@@ -14,6 +17,14 @@ enum Fault { F_NONE, F_HOST_CALLOC, F_RESOURCE, F_MALLOC, F_COPY, F_PARAMS,
              F_GRAPH_ALLOC, F_GRAPH_WORK, F_GRAPH_PUBLISHED,
              F_FROM_ARGS, F_SERIALIZE, F_OLD_DESTROY };
 static enum Fault fault;
+static char test_directory[4096];
+static const char* test_path(const char* name)
+{
+  static char path[4096];
+  int size = snprintf(path, sizeof(path), "%s/%s", test_directory, name);
+  assert(size > 0 && (size_t)size < sizeof(path));
+  return path;
+}
 static void *bridge_calloc(size_t n, size_t bytes)
 {
   return fault == F_HOST_CALLOC ? NULL : calloc(n, bytes);
@@ -72,11 +83,13 @@ cudaError_t cudaFree(void *ptr)
 }
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t bytes, int kind)
 {
-  assert((kind == cudaMemcpyDefault || kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice) && dst && src); ++copies;
+  assert((kind == cudaMemcpyDefault || kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyHostToDevice) && dst && src); ++copies;
   if (fault == F_COPY || copies == copy_fail_at) return cudaErrorUnknown;
-  if (dst == device_input) assert(bytes == device_bytes);
+  if (dst == device_input) assert(bytes <= device_bytes);
   memcpy(dst, src, bytes); return cudaSuccess;
 }
+cudaError_t cudaGetDevice(int *device)
+{ *device = 0; return cudaSuccess; }
 cudaError_t cudaDeviceSynchronize(void)
 {
   ++sync_calls; last_sync = ++operation_clock;
@@ -166,6 +179,9 @@ cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
 {
   ++build_calls;
   retain_dataset(r, p, t, i);
+  i->graph = (unsigned int *)malloc((size_t)i->n * (size_t)i->degree * 4); assert(i->graph);
+  for (int64_t j = 0; j < i->n * i->degree; ++j) i->graph[j] = (unsigned int)(j % i->n);
+  ++owned_graphs;
   return fault == F_BUILD ? CUVS_ERROR : CUVS_SUCCESS;
 }
 /* Only an ownership fake: the actual GPU helper is never built or linked into
@@ -180,6 +196,7 @@ int seekdb_ivfpq_gpu_graph(cuvsResources_t r, cuvsCagraIndexParams_t p,
   if (fault == F_GRAPH_ALLOC) return 1;
   device_graph = (unsigned int *)malloc((size_t)t->dl_tensor.shape[0] * 128 * sizeof(unsigned int));
   assert(device_graph); ++allocations;
+  for (int64_t j = 0; j < expected_n * 128; ++j) device_graph[j] = (unsigned int)(j % expected_n);
   if (fault == F_GRAPH_WORK) {
     /* Unpublished work is fenced and released inside the helper. */
     assert(cuvsStreamSync(r) == CUVS_SUCCESS);
@@ -209,7 +226,7 @@ cuvsError_t cuvsCagraDeserialize(cuvsResources_t r, const char *path, cuvsCagraI
   memcpy(i->dataset, expected, bytes); ++owned_datasets;
   i->degree = 3; /* Deliberately not the competition graph degree. */
   i->graph = (unsigned int *)malloc((size_t)i->n * (size_t)i->degree * 4); assert(i->graph);
-  for (int64_t j = 0; j < i->n * i->degree; ++j) i->graph[j] = (unsigned int)j;
+  for (int64_t j = 0; j < i->n * i->degree; ++j) i->graph[j] = (unsigned int)(j % i->n);
   ++owned_graphs; return CUVS_SUCCESS;
 }
 cuvsError_t cuvsCagraIndexGetSize(cuvsCagraIndex_t i, int64_t *n)
@@ -278,9 +295,8 @@ cuvsError_t cuvsCagraIndexGetGraph(cuvsCagraIndex_t i, DLManagedTensor *t)
 cuvsError_t cuvsCagraIndexFromArgs(cuvsResources_t r, int metric, DLManagedTensor *g,
                                  DLManagedTensor *d, cuvsCagraIndex_t i)
 {
-  assert(r && metric == L2Expanded && i == secondary_index && active_index);
+  assert(r && metric == L2Expanded && i == active_index && !secondary_index && !i->dataset && !i->graph);
   assert(!memcmp(d->dl_tensor.data, expected, (size_t)expected_n * (size_t)expected_dim * 4));
-  assert(!memcmp(g->dl_tensor.data, active_index->graph, (size_t)expected_n * (size_t)active_index->degree * 4));
   assert(!d->dl_tensor.strides && !g->dl_tensor.strides && !d->dl_tensor.byte_offset && !g->dl_tensor.byte_offset);
   i->n = d->dl_tensor.shape[0]; i->dim = d->dl_tensor.shape[1]; i->degree = g->dl_tensor.shape[1];
   i->dataset = (float *)d->dl_tensor.data; i->graph = (unsigned int *)g->dl_tensor.data;
@@ -318,42 +334,16 @@ static void success_case(long n, long dim)
   assert(gpu_graph_calls - gpu_before == (n >= SEEKDB_IVFPQ_MIN_ROWS));
   assert(((sk_cuvs_index *)h)->graph_device == device_graph);
   assert(!!device_graph == (n >= SEEKDB_IVFPQ_MIN_ROWS));
-  assert(seekdb_cuvs_serialize(h, "fake.snapshot") == 0);
+  assert(seekdb_cuvs_serialize(h, test_path("fake.snapshot")) == 0);
   seekdb_cuvs_free(h); no_live_resources();
 
   /* Loaded aligned indexes acquire bridge ownership only when serialized. */
   reset_order(); a = allocations; c = build_calls;
-  h = seekdb_cuvs_deserialize("fake.snapshot", (long)expected_n, dim); assert(h);
-  assert(!((sk_cuvs_index *)h)->base_device && !((sk_cuvs_index *)h)->graph_device && allocations == a && build_calls == c);
-  assert(seekdb_cuvs_serialize(h, "fake.loaded") == 0);
-  assert(!!((sk_cuvs_index *)h)->base_device == !(dim % 4));
+  h = seekdb_cuvs_deserialize(test_path("fake.snapshot"), (long)expected_n, dim); assert(h);
+  assert(((sk_cuvs_index *)h)->base_device == device_input && ((sk_cuvs_index *)h)->graph_device == device_graph && allocations == a + 2 && build_calls == c);
+  assert(seekdb_cuvs_serialize(h, test_path("fake.loaded")) == 0);
+  assert(((sk_cuvs_index *)h)->base_device == device_input);
   seekdb_cuvs_free(h); no_live_resources(); free(base); expected = NULL;
-}
-static void loaded_serialize_lifetime_failure(void)
-{
-  float base[4 * 12]; for (size_t j = 0; j < 48; ++j) base[j] = (float)j;
-  expected = base; expected_n = 4; expected_dim = 12;
-  view_row_stride = 0; view_byte_offset = 0; null_view_strides = 0; view_fault = V_VALID;
-  const enum Fault failures[] = {F_FROM_ARGS, F_SERIALIZE, F_OLD_DESTROY};
-  for (size_t j = 0; j < sizeof(failures) / sizeof(failures[0]); ++j) {
-    fault = F_NONE; reset_order();
-    sk_cuvs_index *h = (sk_cuvs_index *)seekdb_cuvs_deserialize("fake.lifetime", 4, 12); assert(h);
-    cuvsCagraIndex_t old = h->idx; fault = failures[j];
-    assert(seekdb_cuvs_serialize(h, "fake.failure") != 0);
-    if (fault == F_FROM_ARGS) {
-      assert(h->idx == old && !h->base_device && !h->graph_device);
-      assert(owned_datasets == 1 && owned_graphs == 1 && !device_input && !device_graph);
-    } else if (fault == F_SERIALIZE) {
-      assert(h->idx != old && h->base_device == device_input && h->graph_device == device_graph);
-      assert(!owned_datasets && !owned_graphs); /* Fixed serializer failure must not drop live borrowed buffers. */
-    } else {
-      assert(!h->idx && !h->base_device && !h->graph_device);
-      assert(seekdb_cuvs_serialize(h, "fake.retry") != 0); /* Consumed old idx is never reused/destroyed twice. */
-    }
-    fault = F_NONE;
-    seekdb_cuvs_free(h); no_live_resources();
-  }
-  expected = NULL;
 }
 static void dataset_restore_cases(int padded, int offset, int no_strides)
 {
@@ -364,7 +354,7 @@ static void dataset_restore_cases(int padded, int offset, int no_strides)
   }
   expected = base; expected_n = 4; expected_dim = 5;
   fault = F_NONE; view_fault = V_VALID; reset_order();
-  void *h = seekdb_cuvs_deserialize("fake.dataset", 4, 5); assert(h);
+  void *h = seekdb_cuvs_deserialize(test_path("fake.dataset"), 4, 5); assert(h);
   view_row_stride = padded ? 8 : 5; view_byte_offset = offset ? 16 : 0;
   null_view_strides = no_strides;
   if (padded || offset) {
@@ -420,15 +410,78 @@ static void dataset_restore_cases(int padded, int offset, int no_strides)
   assert(dataset_view_deletes == released);
   seekdb_cuvs_free(h); no_live_resources(); expected = NULL;
 }
+
+/* Real files, exact graph/FP32 bytes, legacy padded-view conversion, and
+ * corrupt/truncated/extra payloads: no mocked serialization can make this pass. */
+static void stream_roundtrip_case(void)
+{
+  float base[4 * 5], restored[4 * 5];
+  for (size_t j = 0; j < 20; ++j) {
+    uint32_t bits = j == 0 ? UINT32_C(0x80000000) : j == 1 ? UINT32_C(0x7fc00123) : UINT32_C(0x3f800000) + (uint32_t)j;
+    memcpy(base + j, &bits, 4);
+  }
+  expected = base; expected_n = 4; expected_dim = 5;
+  fault = F_NONE; view_fault = V_VALID; reset_order();
+  sk_cuvs_index *h = (sk_cuvs_index *)seekdb_cuvs_deserialize(test_path("fake.legacy"), 4, 5); assert(h);
+  float *padded = (float *)malloc(16 + 4 * 8 * 4); assert(padded);
+  memset(padded, 0xa5, 16 + 4 * 8 * 4);
+  for (size_t row = 0; row < 4; ++row) memcpy((char *)padded + 16 + row * 8 * 4, base + row * 5, 5 * 4);
+  free(active_index->dataset); active_index->dataset = padded;
+  view_row_stride = 8; view_byte_offset = 16; null_view_strides = 0;
+  int sdk_calls = serialize_calls;
+  assert(seekdb_cuvs_serialize(h, test_path("stream.first")) == 0 && serialize_calls == sdk_calls);
+  seekdb_cuvs_free(h); no_live_resources();
+  view_row_stride = 0; view_byte_offset = 0;
+  h = (sk_cuvs_index *)seekdb_cuvs_deserialize(test_path("stream.first"), 4, 5); assert(h);
+  assert(h->base_device == device_input && h->graph_device == device_graph);
+  assert(seekdb_cuvs_copy_dataset(h, restored, 4, 5) == 0 && !memcmp(base, restored, sizeof(base)));
+  assert(active_index->degree == 3);
+  for (size_t j = 0; j < 12; ++j) assert(active_index->graph[j] == j % 4);
+  assert(seekdb_cuvs_serialize(h, test_path("stream.second")) == 0 && serialize_calls == sdk_calls);
+  seekdb_cuvs_free(h); no_live_resources();
+  unsigned char first[192], second[192]; /*64+4*3*4+4*5*4*/
+  FILE *file = fopen(test_path("stream.first"), "rb"); assert(file);
+  assert(fread(first, 1, sizeof(first), file) == sizeof(first) && fgetc(file) == EOF && !ferror(file) && fclose(file) == 0);
+  file = fopen(test_path("stream.second"), "rb"); assert(file);
+  assert(fread(second, 1, sizeof(second), file) == sizeof(second) && fgetc(file) == EOF && !ferror(file) && fclose(file) == 0);
+  assert(!memcmp(first, second, sizeof(first)) && !memcmp(first, "SKCAGR04", 8));
+  for (int damage = 0; damage < 3; ++damage) {
+    file = fopen(test_path("stream.bad"), "wb"); assert(file);
+    unsigned char damaged[192]; memcpy(damaged, first, sizeof(first));
+    if (damage == 0) damaged[sizeof(damaged) - 1] ^= 1;
+    const size_t bytes = damage == 1 ? sizeof(damaged) - 4 : sizeof(damaged);
+    assert(fwrite(damaged, 1, bytes, file) == bytes);
+    if (damage == 2) assert(fputc(0, file) == 0);
+    assert(fclose(file) == 0);
+    reset_order(); assert(!seekdb_cuvs_deserialize(test_path("stream.bad"), 4, 5)); no_live_resources();
+  }
+  /* Allocation/copy cleanup, and FromArgs retaining buffers before failure. */
+  const enum Fault failures[] = {F_MALLOC, F_COPY, F_FROM_ARGS};
+  for (size_t j = 0; j < sizeof(failures) / sizeof(failures[0]); ++j) {
+    fault = failures[j]; reset_order();
+    assert(!seekdb_cuvs_deserialize(test_path("stream.first"), 4, 5)); no_live_resources();
+  }
+  fault = F_NONE; expected = NULL;
+}
 int main(void)
 {
+  const char *temporary = getenv("TMPDIR");
+  assert(temporary && temporary[0] == '/');
+  int path_size = snprintf(test_directory, sizeof(test_directory), "%s/seekdb-stream-XXXXXX", temporary);
+  assert(path_size > 0 && (size_t)path_size < sizeof(test_directory) && mkdtemp(test_directory));
+  const char *legacy_names[] = {"fake.dataset", "fake.legacy"};
+  for (size_t j = 0; j < 2; ++j) {
+    FILE *file = fopen(test_path(legacy_names[j]), "wb"); assert(file);
+    assert(fwrite("LEGACY00", 1, 8, file) == 8 && fclose(file) == 0);
+  }
+
   success_case(4, 128); success_case(4, 256); success_case(4, 129);
   success_case(SEEKDB_IVFPQ_MIN_ROWS - 1, 128);
   success_case(SEEKDB_IVFPQ_MIN_ROWS, 128);
   success_case(256, 256); success_case(256, 129);
-  loaded_serialize_lifetime_failure();
   dataset_restore_cases(0, 0, 0); dataset_restore_cases(1, 1, 0);
   dataset_restore_cases(0, 1, 1);
+  stream_roundtrip_case();
   float base[4 * 128] = {0}; expected = base; expected_n = 4; expected_dim = 128;
   for (int f = F_HOST_CALLOC; f <= F_BUILD; ++f) {
     fault = (enum Fault)f; reset_order();
@@ -449,7 +502,7 @@ int main(void)
   }
   free(gpu_base); expected = base; expected_n = 4; expected_dim = 128;
   fault = F_LOAD; reset_order();
-  assert(!seekdb_cuvs_deserialize("fake.snapshot", 4, 128)); no_live_resources();
+  assert(!seekdb_cuvs_deserialize(test_path("fake.legacy"), 4, 128)); no_live_resources();
   fault = F_NONE; reset_order();
   int a = allocations, b = build_calls;
   assert(!seekdb_cuvs_build(NULL, 4, 128));
@@ -462,5 +515,10 @@ int main(void)
   assert(allocations == a && build_calls == b); no_live_resources();
   printf("PASS CPU fake ownership: native/custom dispatch, aligned128/256, unaligned129, unpublished/published graph failures, reload, overflow; alloc/free=%d/%d native=%d custom=%d serialize=%d load=%d sync=%d\n",
          allocations, frees, build_calls, gpu_graph_calls, serialize_calls, load_calls, sync_calls);
+  DIR *directory = opendir(test_directory); assert(directory);
+  struct dirent *entry;
+  while ((entry = readdir(directory)))
+    if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) assert(unlink(test_path(entry->d_name)) == 0);
+  assert(closedir(directory) == 0 && rmdir(test_directory) == 0);
   return 0;
 }

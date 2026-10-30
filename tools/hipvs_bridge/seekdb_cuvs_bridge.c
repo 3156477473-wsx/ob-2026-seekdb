@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <float.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -118,9 +119,11 @@ void seekdb_cuvs_free(void* handle)
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
   (void)cuvsStreamSync(h->res);
-  if (h->idx) cuvsCagraIndexDestroy(h->idx);
-  if (h->graph_device) cudaFree(h->graph_device);
-  if (h->base_device) cudaFree(h->base_device);
+  const int buffers_safe = !h->idx || cuvsCagraIndexDestroy(h->idx) == CUVS_SUCCESS;
+  if (buffers_safe) {
+    if (h->graph_device) cudaFree(h->graph_device);
+    if (h->base_device) cudaFree(h->base_device);
+  }
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
   free(h);
@@ -158,150 +161,209 @@ static int sk_cuvs_snapshot_view(const DLManagedTensor* view, long n, int64_t di
   return 0;
 }
 
-static int sk_cuvs_snapshot_copy(void* output, const unsigned char* source,
-                                 long n, size_t row_bytes, size_t row_pitch)
+/* SKCAGR04: 64-byte LE header, uint32 graph rows, then exact FP32 bits.
+ * No SDK serialization or host-side graph/vector conversion is involved. */
+#define SK_SNAPSHOT_CHUNK (8u * 1024u * 1024u)
+static const unsigned char sk_snapshot_magic[8] = {'S','K','C','A','G','R','0','4'};
+static uint64_t sk_snapshot_u64(const unsigned char* p)
 {
-  if (row_bytes == row_pitch)
-    return cudaMemcpy(output, source, (size_t)n * row_bytes, cudaMemcpyDeviceToDevice) != cudaSuccess;
-  for (size_t row = 0; row < (size_t)n; ++row)
-    if (cudaMemcpy((unsigned char*)output + row * row_bytes, source + row * row_pitch,
-                   row_bytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
+  uint64_t v = 0;
+  for (unsigned i = 0; i < 8; ++i) v |= (uint64_t)p[i] << (8 * i);
+  return v;
+}
+static uint32_t sk_snapshot_u32(const unsigned char* p)
+{
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static void sk_snapshot_put64(unsigned char* p, uint64_t v)
+{ for (unsigned i = 0; i < 8; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
+static void sk_snapshot_put32(unsigned char* p, uint32_t v)
+{ for (unsigned i = 0; i < 4; ++i) p[i] = (unsigned char)(v >> (8 * i)); }
+static int sk_snapshot_platform(void)
+{
+  const uint32_t one = 1;
+  return sizeof(float) == 4 && sizeof(unsigned int) == 4 && FLT_RADIX == 2 &&
+         FLT_MANT_DIG == 24 && FLT_MAX_EXP == 128 &&
+         *(const unsigned char*)&one == 1;
+}
+/* Word-wise FNV-style corruption check; chunks always end on uint32 boundaries.
+ * This is not a cryptographic signature or a replacement for external SHA256. */
+static uint64_t sk_snapshot_checksum(uint64_t hash, const unsigned char* bytes, size_t size)
+{
+  for (size_t i = 0; i < size; i += 4)
+    hash = (hash ^ sk_snapshot_u32(bytes + i)) * UINT64_C(1099511628211);
+  return hash;
+}
+static int sk_snapshot_write_view(FILE* file, unsigned char* buffer, const unsigned char* source,
+                                   long n, size_t row_bytes, size_t pitch, uint64_t* checksum)
+{
+  const size_t total = (size_t)n * row_bytes;
+  for (size_t at = 0; at < total;) {
+    size_t count = total - at;
+    const unsigned char* src = source + at;
+    if (pitch != row_bytes) {
+      const size_t row = at / row_bytes, col = at % row_bytes;
+      src = source + row * pitch + col;
+      count = row_bytes - col;
+    }
+    if (count > SK_SNAPSHOT_CHUNK) count = SK_SNAPSHOT_CHUNK;
+    if (cudaMemcpy(buffer, src, count, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        fwrite(buffer, 1, count, file) != count) return 1;
+    *checksum = sk_snapshot_checksum(*checksum, buffer, count);
+    at += count;
+  }
+  return 0;
+}
+static int sk_snapshot_read_gpu(FILE* file, unsigned char* buffer, void* output,
+                                 size_t bytes, uint64_t* checksum)
+{
+  for (size_t at = 0; at < bytes;) {
+    size_t count = bytes - at;
+    if (count > SK_SNAPSHOT_CHUNK) count = SK_SNAPSHOT_CHUNK;
+    if (fread(buffer, 1, count, file) != count) return 1;
+    *checksum = sk_snapshot_checksum(*checksum, buffer, count);
+    if (cudaMemcpy((unsigned char*)output + at, buffer, count,
+                   cudaMemcpyHostToDevice) != cudaSuccess) return 1;
+    at += count;
+  }
   return 0;
 }
 
-/* The fixed SDK's reloaded dataset layout can serialize incorrect data even
- * after a successful FP32 copy and stream sync. Rebind the exact dataset and
- * graph to bridge-owned cudaMalloc buffers before reserialization. Fresh aligned
- * builds already own their input and take no extra copy. Unaligned logical rows
- * retain the SDK path: FromArgs would otherwise create another SDK padded copy. */
-static int sk_cuvs_snapshot_own_loaded(sk_cuvs_index* h)
+int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  if (!h || !h->idx || !filename || h->n <= 0 || h->dim <= 0 ||
+      (uint64_t)h->n > UINT32_MAX || !sk_snapshot_platform()) return 1;
   DLManagedTensor base_view = {0}, graph_view = {0};
-  DLManagedTensor base_tensor = {0}, graph_tensor = {0};
-  const unsigned char *base_source = NULL, *graph_source = NULL;
+  const unsigned char *base = NULL, *graph = NULL;
   size_t base_row = 0, base_pitch = 0, graph_row = 0, graph_pitch = 0;
-  float* base = NULL;
-  unsigned int* graph = NULL;
-  cuvsCagraIndex_t replacement = NULL;
   int64_t n = 0, dim = 0, degree = 0;
-  int64_t base_shape[2] = {h->n, h->dim}, graph_shape[2] = {h->n, 0};
+  unsigned char header[64] = {0};
+  unsigned char* buffer = NULL;
+  FILE* file = NULL;
+  uint64_t checksum = UINT64_C(14695981039346656037);
   int rc = 1;
-  if (h->base_device || (h->dim % 4) != 0) return 0;
-  if (!h->idx || h->n <= 0 || h->dim <= 0 || (uint64_t)h->n > UINT32_MAX) return 1;
   do {
     if (cuvsStreamSync(h->res) != CUVS_SUCCESS ||
         cuvsCagraIndexGetSize(h->idx, &n) != CUVS_SUCCESS ||
         cuvsCagraIndexGetDims(h->idx, &dim) != CUVS_SUCCESS ||
         cuvsCagraIndexGetGraphDegree(h->idx, &degree) != CUVS_SUCCESS ||
         n != h->n || dim != h->dim || degree <= 0 ||
-        cuvsCagraIndexGetDataset(h->idx, &base_view) != CUVS_SUCCESS ||
-        cuvsCagraIndexGetGraph(h->idx, &graph_view) != CUVS_SUCCESS) break;
-    if (sk_cuvs_snapshot_view(&base_view, h->n, h->dim, kDLFloat, &base_source, &base_row, &base_pitch) ||
-        sk_cuvs_snapshot_view(&graph_view, h->n, degree, kDLUInt, &graph_source, &graph_row, &graph_pitch) ||
+        cuvsCagraIndexGetGraph(h->idx, &graph_view) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetDataset(h->idx, &base_view) != CUVS_SUCCESS) break;
+    if (sk_cuvs_snapshot_view(&base_view, h->n, h->dim, kDLFloat, &base, &base_row, &base_pitch) ||
+        sk_cuvs_snapshot_view(&graph_view, h->n, degree, kDLUInt, &graph, &graph_row, &graph_pitch) ||
         base_view.dl_tensor.device.device_id != graph_view.dl_tensor.device.device_id) break;
-    if (cudaMalloc((void**)&base, (size_t)h->n * base_row) != cudaSuccess ||
-        cudaMalloc((void**)&graph, (size_t)h->n * graph_row) != cudaSuccess ||
-        sk_cuvs_snapshot_copy(base, base_source, h->n, base_row, base_pitch) ||
-        sk_cuvs_snapshot_copy(graph, graph_source, h->n, graph_row, graph_pitch) ||
-        cudaDeviceSynchronize() != cudaSuccess ||
-        cuvsCagraIndexCreate(&replacement) != CUVS_SUCCESS) break;
-    base_tensor.dl_tensor = base_view.dl_tensor;
-    base_tensor.dl_tensor.data = base;
-    base_tensor.dl_tensor.device.device_type = kDLCUDA;
-    base_tensor.dl_tensor.shape = base_shape;
-    base_tensor.dl_tensor.strides = NULL;
-    base_tensor.dl_tensor.byte_offset = 0;
-    graph_shape[1] = degree;
-    graph_tensor.dl_tensor = graph_view.dl_tensor;
-    graph_tensor.dl_tensor.data = graph;
-    graph_tensor.dl_tensor.device.device_type = kDLCUDA;
-    graph_tensor.dl_tensor.shape = graph_shape;
-    graph_tensor.dl_tensor.strides = NULL;
-    graph_tensor.dl_tensor.byte_offset = 0;
-    /* This bridge constructs L2Expanded indexes; do not rebuild or reorder the
-     * copied graph. Index header dtype.lanes is not reliable after SDK reload;
-     * the actual public tensor views above must still report FP32/uint32 lanes1. */
-    if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &graph_tensor, &base_tensor, replacement) != CUVS_SUCCESS ||
-        !replacement->addr || cudaDeviceSynchronize() != cudaSuccess ||
-        cuvsCagraIndexGetSize(replacement, &n) != CUVS_SUCCESS ||
-        cuvsCagraIndexGetDims(replacement, &dim) != CUVS_SUCCESS ||
-        cuvsCagraIndexGetGraphDegree(replacement, &degree) != CUVS_SUCCESS ||
-        n != h->n || dim != h->dim || degree != graph_shape[1]) break;
-    /* Destroy may fail after consuming its object. Clear the published pointer
-     * first so that no later search/copy/free can reuse a dangling old index.
-     * On that exceptional path retain old borrowed graph storage until process
-     * cleanup, rather than freeing memory a partially destroyed index may use. */
-    {
-      cuvsCagraIndex_t old = h->idx;
-      unsigned int* old_graph = h->graph_device;
-      h->idx = NULL;
-      h->graph_device = NULL;
-      if (cuvsCagraIndexDestroy(old) != CUVS_SUCCESS) break;
-      if (old_graph && cudaFree(old_graph) != cudaSuccess) break;
-    }
-    h->idx = replacement; replacement = NULL;
-    h->base_device = base; base = NULL;
-    h->graph_device = graph; graph = NULL;
+    const size_t graph_bytes = (size_t)h->n * graph_row, base_bytes = (size_t)h->n * base_row;
+    if (graph_bytes > SIZE_MAX - 64 || base_bytes > SIZE_MAX - 64 - graph_bytes) break;
+    memcpy(header, sk_snapshot_magic, 8);
+    sk_snapshot_put32(header + 8, 4);
+    sk_snapshot_put32(header + 12, (uint32_t)L2Expanded);
+    sk_snapshot_put64(header + 16, (uint64_t)h->n);
+    sk_snapshot_put64(header + 24, (uint64_t)h->dim);
+    sk_snapshot_put64(header + 32, (uint64_t)degree);
+    sk_snapshot_put64(header + 40, (uint64_t)graph_bytes);
+    sk_snapshot_put64(header + 48, (uint64_t)base_bytes);
+    buffer = (unsigned char*)malloc(SK_SNAPSHOT_CHUNK);
+    if (!buffer || !(file = fopen(filename, "wb")) || fwrite(header, 1, sizeof(header), file) != sizeof(header)) break;
+    if (sk_snapshot_write_view(file, buffer, graph, h->n, graph_row, graph_pitch, &checksum) ||
+        sk_snapshot_write_view(file, buffer, base, h->n, base_row, base_pitch, &checksum)) break;
+    sk_snapshot_put64(header + 56, checksum);
+    if (fseek(file, 0, SEEK_SET) != 0 || fwrite(header, 1, sizeof(header), file) != sizeof(header)) break;
     rc = 0;
   } while (0);
+  if (file && fclose(file) != 0) rc = 1;
+  free(buffer);
   if (base_view.deleter) base_view.deleter(&base_view);
   if (graph_view.deleter) graph_view.deleter(&graph_view);
-  if (replacement) {
-    (void)cudaDeviceSynchronize();
-    if (cuvsCagraIndexDestroy(replacement) != CUVS_SUCCESS) {
-      /* Unknown destruction state: never free buffers it might still borrow. */
-      base = NULL; graph = NULL;
-    }
-  }
-  if (graph) cudaFree(graph);
-  if (base) cudaFree(base);
-  if (rc) fprintf(stderr, "[seekdb_cuvs] snapshot ownership copy failed: %s\n", cuvsGetLastErrorText());
+  if (rc) fprintf(stderr, "[seekdb_cuvs] stream serialize failed: %s\n", cuvsGetLastErrorText());
   return rc;
-}
-
-int seekdb_cuvs_serialize(void* handle, const char* filename)
-{
-  sk_cuvs_index* index = (sk_cuvs_index*)handle;
-  if (!index || !index->idx || !filename || sk_cuvs_snapshot_own_loaded(index)) return 1;
-  if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
-    fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
-    return 1;
-  }
-  return 0;
 }
 
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 {
   if (!filename || n <= 0 || dim <= 0) return NULL;
-  sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
-  if (!index) return NULL;
-  if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
-  if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
-  if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraDeserialize(index->res, filename, index->idx) != CUVS_SUCCESS) goto fail_idx;
-  {
-    int64_t actual_n = 0;
-    int64_t actual_dim = 0;
-    if (cuvsCagraIndexGetSize(index->idx, &actual_n) != CUVS_SUCCESS ||
-        cuvsCagraIndexGetDims(index->idx, &actual_dim) != CUVS_SUCCESS ||
-        actual_n != n || actual_dim != dim) {
-      fprintf(stderr, "[seekdb_cuvs] snapshot shape mismatch: %ld x %ld, expected %ld x %ld\n",
-              (long)actual_n, (long)actual_dim, n, dim);
-      goto fail_idx;
-    }
+  FILE* file = fopen(filename, "rb");
+  if (!file) return NULL;
+  unsigned char header[64] = {0};
+  unsigned char* buffer = NULL;
+  sk_cuvs_index* h = NULL;
+  const size_t prefix = fread(header, 1, 8, file);
+  const int streaming = prefix == 8 && memcmp(header, sk_snapshot_magic, 8) == 0;
+  int ok = 0;
+  if (prefix != 8) { fclose(file); return NULL; }
+  if (!streaming) {
+    if (fclose(file) != 0) return NULL;
+    file = NULL; /* Legacy SDK files are read by the unchanged SDK reader. */
   }
-  index->n = n;
-  index->dim = dim;
-  return index;
-fail_idx:
-  cuvsCagraIndexDestroy(index->idx);
-fail_ip:
-  cuvsCagraIndexParamsDestroy(index->ip);
-fail_res:
-  cuvsResourcesDestroy(index->res);
-fail:
-  fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
-  free(index);
+  h = (sk_cuvs_index*)calloc(1, sizeof(*h));
+  if (!h) { if (file) fclose(file); return NULL; }
+  do {
+    if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS ||
+        cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS ||
+        cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) break;
+    if (!streaming) {
+      if (cuvsCagraDeserialize(h->res, filename, h->idx) != CUVS_SUCCESS) break;
+    } else {
+      if (!sk_snapshot_platform() || fread(header + 8, 1, 56, file) != 56) break;
+      const uint64_t rows = sk_snapshot_u64(header + 16), columns = sk_snapshot_u64(header + 24);
+      const uint64_t degree = sk_snapshot_u64(header + 32), graph_bytes = sk_snapshot_u64(header + 40);
+      const uint64_t base_bytes = sk_snapshot_u64(header + 48), expected_checksum = sk_snapshot_u64(header + 56);
+      if (sk_snapshot_u32(header + 8) != 4 || sk_snapshot_u32(header + 12) != (uint32_t)L2Expanded ||
+          rows != (uint64_t)n || columns != (uint64_t)dim || rows > UINT32_MAX ||
+          !degree || degree > INT64_MAX || columns > SIZE_MAX / 4 || degree > SIZE_MAX / 4 ||
+          rows > SIZE_MAX / (columns * 4) || rows > SIZE_MAX / (degree * 4) ||
+          base_bytes != rows * columns * 4 || graph_bytes != rows * degree * 4 ||
+          graph_bytes > SIZE_MAX - 64 || base_bytes > SIZE_MAX - 64 - graph_bytes) break;
+      buffer = (unsigned char*)malloc(SK_SNAPSHOT_CHUNK);
+      if (!buffer || cudaMalloc((void**)&h->base_device, (size_t)base_bytes) != cudaSuccess ||
+          cudaMalloc((void**)&h->graph_device, (size_t)graph_bytes) != cudaSuccess) break;
+      uint64_t checksum = UINT64_C(14695981039346656037);
+      if (sk_snapshot_read_gpu(file, buffer, h->graph_device, (size_t)graph_bytes, &checksum) ||
+          sk_snapshot_read_gpu(file, buffer, h->base_device, (size_t)base_bytes, &checksum) ||
+          checksum != expected_checksum) break;
+      const int tail = fgetc(file);
+      if (tail != EOF || ferror(file)) break;
+      if (fclose(file) != 0) { file = NULL; break; }
+      file = NULL;
+      if (cudaDeviceSynchronize() != cudaSuccess) break;
+      int device = -1;
+      if (cudaGetDevice(&device) != cudaSuccess || device < 0) break;
+      int64_t base_shape[2] = {n, dim}, graph_shape[2] = {n, (int64_t)degree};
+      DLManagedTensor base = {0}, graph = {0};
+      base.dl_tensor.data = h->base_device;
+      base.dl_tensor.device.device_type = kDLCUDA; base.dl_tensor.device.device_id = device;
+      base.dl_tensor.ndim = 2; base.dl_tensor.dtype.code = kDLFloat;
+      base.dl_tensor.dtype.bits = 32; base.dl_tensor.dtype.lanes = 1;
+      base.dl_tensor.shape = base_shape;
+      graph.dl_tensor = base.dl_tensor;
+      graph.dl_tensor.data = h->graph_device; graph.dl_tensor.dtype.code = kDLUInt;
+      graph.dl_tensor.shape = graph_shape;
+      if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &graph, &base, h->idx) != CUVS_SUCCESS ||
+          !h->idx->addr || cuvsStreamSync(h->res) != CUVS_SUCCESS || cudaDeviceSynchronize() != cudaSuccess) break;
+      int64_t actual_degree = 0;
+      if (cuvsCagraIndexGetGraphDegree(h->idx, &actual_degree) != CUVS_SUCCESS || (uint64_t)actual_degree != degree) break;
+    }
+    int64_t actual_n = 0, actual_dim = 0;
+    if (cuvsCagraIndexGetSize(h->idx, &actual_n) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetDims(h->idx, &actual_dim) != CUVS_SUCCESS || actual_n != n || actual_dim != dim) break;
+    h->n = n; h->dim = dim;
+    ok = 1;
+  } while (0);
+  if (file && fclose(file) != 0) ok = 0;
+  if (!ok && h->res) (void)cudaDeviceSynchronize();
+  free(buffer);
+  if (ok) return h;
+  if (h->res) (void)cuvsStreamSync(h->res);
+  int buffers_safe = !h->idx || cuvsCagraIndexDestroy(h->idx) == CUVS_SUCCESS;
+  if (buffers_safe) {
+    if (h->graph_device) cudaFree(h->graph_device);
+    if (h->base_device) cudaFree(h->base_device);
+  }
+  if (h->ip) cuvsCagraIndexParamsDestroy(h->ip);
+  if (h->res) cuvsResourcesDestroy(h->res);
+  free(h);
+  fprintf(stderr, "[seekdb_cuvs] stream/legacy deserialize failed: %s\n", cuvsGetLastErrorText());
   return NULL;
 }
 
