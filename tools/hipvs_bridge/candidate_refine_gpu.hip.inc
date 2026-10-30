@@ -11,7 +11,40 @@
  * Every failure leaves the overall construction rejected, never a success with
  * substituted/fabricated neighbors. Output is UINT32_MAX until actually filled.
  */
-template <unsigned OutputDegree, unsigned MaxCandidates = 1024>
+/* Three-byte IDs: naturally aligned low16[count], then high8[count].
+ * 0xffffff is reserved for UINT32_MAX; every real ID must be < rows. */
+static_assert(sizeof(unsigned) == 4, "CAGRA uint32 ID storage");
+__host__ __device__ inline bool seekdb_knn_use_u24(uint64_t rows)
+{ return rows > 0 && rows <= UINT64_C(0x00ffffff); }
+static inline bool seekdb_knn_storage_size(size_t rows, unsigned columns, bool packed, size_t* bytes)
+{
+  const size_t width = packed ? 3 : sizeof(unsigned);
+  if (!bytes || !rows || !columns || rows > SIZE_MAX / columns) return false;
+  const size_t entries = rows * columns;
+  if (entries > SIZE_MAX / width) return false;
+  *bytes = entries * width;
+  return true;
+}
+template<bool Packed>
+__device__ inline void seekdb_knn_store(unsigned* storage, size_t entries, size_t at, unsigned id)
+{
+  if constexpr (Packed) {
+    const unsigned value = id == UINT32_MAX ? 0x00ffffffu : id;
+    reinterpret_cast<uint16_t*>(storage)[at] = uint16_t(value);
+    (reinterpret_cast<uint8_t*>(storage) + entries * 2)[at] = uint8_t(value >> 16);
+  } else storage[at] = id;
+}
+template<bool Packed>
+__device__ inline unsigned seekdb_knn_load(const unsigned* storage, size_t entries, size_t at)
+{
+  if constexpr (Packed) {
+    const unsigned value = unsigned(reinterpret_cast<const uint16_t*>(storage)[at]) |
+        (unsigned((reinterpret_cast<const uint8_t*>(storage) + entries * 2)[at]) << 16);
+    return value == 0x00ffffffu ? UINT32_MAX : value;
+  } else return storage[at];
+}
+
+template <unsigned OutputDegree, unsigned MaxCandidates = 1024, bool PackedIds = false>
 __global__ void seekdb_refine_candidate_graph_l2(
     const float* dataset,
     int64_t dim,
@@ -34,14 +67,16 @@ __global__ void seekdb_refine_candidate_graph_l2(
   const uint64_t self64 = uint64_t(offset) + row;
   if (!dataset || !candidates || !graph || !errors || dim <= 0 ||
       candidate_k < OutputDegree || candidate_k > max_candidates || self64 >= nrows ||
+      (PackedIds && !seekdb_knn_use_u24(nrows)) ||
       blockDim.x < unsigned(warpSize) || blockDim.x % unsigned(warpSize) != 0) {
     if (threadIdx.x == 0 && errors) atomicOr(errors, 0x100u);
     return;
   }
   const unsigned self = unsigned(self64);
-  unsigned* output = graph + size_t(self) * OutputDegree;
+  const size_t entries = size_t(nrows) * OutputDegree;
+  const size_t output = size_t(self) * OutputDegree;
   for (unsigned i = threadIdx.x; i < OutputDegree; i += blockDim.x)
-    output[i] = UINT32_MAX;
+    seekdb_knn_store<PackedIds>(graph, entries, output + i, UINT32_MAX);
   unsigned padded = 1;
   while (padded < candidate_k) padded <<= 1;
   for (unsigned i = threadIdx.x; i < padded; i += blockDim.x) {
@@ -119,7 +154,7 @@ __global__ void seekdb_refine_candidate_graph_l2(
       const unsigned id = ids[c];
       if (id == UINT32_MAX) break;
       if (id == self || id == previous) continue;
-      output[count++] = id;
+      seekdb_knn_store<PackedIds>(graph, entries, output + count++, id);
       previous = id;
     }
     if (count != OutputDegree) atomicOr(errors, 0x400u);

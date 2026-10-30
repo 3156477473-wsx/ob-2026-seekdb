@@ -149,17 +149,21 @@ __device__ unsigned hash_id(unsigned id) { return (id * 2654435761u) & (hash_siz
 /* Same detour count and (saturating count, original rank) order as fixed
  * graph_core.cuh:187-245,1411-1458. A per-row hash replaces the innermost
  * linear target lookup, reducing O(D^3) comparisons to expected O(D^2). */
+template<bool PackedIds>
 __global__ void prune_graph(const unsigned* graph, unsigned total, unsigned* output) {
   __shared__ unsigned keys[hash_size];
   __shared__ unsigned ranks[hash_size];
   __shared__ unsigned counts[input_degree];
+  __shared__ unsigned decoded_neighbors[input_degree];
   const unsigned row = blockIdx.x;
   for (unsigned k = threadIdx.x; k < hash_size; k += blockDim.x) keys[k] = UINT32_MAX;
   if (threadIdx.x < input_degree) counts[threadIdx.x] = 0;
   __syncthreads();
-  const unsigned* neighbors = graph + size_t(row) * input_degree;
+  const size_t entries = size_t(total) * input_degree;
+  const unsigned* neighbors = PackedIds ? decoded_neighbors : graph + size_t(row) * input_degree;
   if (threadIdx.x < input_degree) {
-    const unsigned id = neighbors[threadIdx.x];
+    const unsigned id = seekdb_knn_load<PackedIds>(graph, entries, size_t(row) * input_degree + threadIdx.x);
+    if constexpr (PackedIds) decoded_neighbors[threadIdx.x] = id;
     unsigned slot = hash_id(id);
     while (atomicCAS(keys + slot, UINT32_MAX, id) != UINT32_MAX) slot = (slot + 1) & (hash_size - 1);
     ranks[slot] = threadIdx.x;
@@ -169,7 +173,7 @@ __global__ void prune_graph(const unsigned* graph, unsigned total, unsigned* out
     const unsigned ad = pair / input_degree;
     const unsigned db = pair % input_degree;
     const unsigned middle = neighbors[ad];
-    const unsigned target = graph[size_t(middle) * input_degree + db];
+    const unsigned target = seekdb_knn_load<PackedIds>(graph, entries, size_t(middle) * input_degree + db);
     unsigned slot = hash_id(target);
     while (keys[slot] != UINT32_MAX && keys[slot] != target) slot = (slot + 1) & (hash_size - 1);
     if (keys[slot] == target && ranks[slot] > ad) atomicAdd(counts + ranks[slot], 1u);
@@ -208,14 +212,16 @@ __global__ void add_block_offsets(size_t* offsets, const size_t* blocks, unsigne
   const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row < rows) offsets[row] += blocks[row / 256];
 }
+template<bool Packed>
 __global__ void transpose_graph(const unsigned* graph, size_t edges, const size_t* offsets,
                                 unsigned* cursors, unsigned* sources, uint8_t* ranks) {
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
        i < edges; i += size_t(blockDim.x) * gridDim.x) {
     const unsigned dest = graph[i];
     const size_t slot = offsets[dest] + atomicAdd(cursors + dest, 1u);
-    sources[slot] = unsigned(i / degree);
-    ranks[slot] = uint8_t(i % degree);
+    const unsigned source = unsigned(i / degree), rank = unsigned(i % degree);
+    sources[slot] = Packed ? source | (rank << 24) : source;
+    if constexpr (!Packed) ranks[slot] = uint8_t(rank);
   }
 }
 __device__ void reverse_set_insert(unsigned* keys, unsigned mask, unsigned value) {
@@ -255,6 +261,7 @@ __device__ unsigned reverse_stable_rank(bool selected, unsigned* wave_counts, un
 /* Preserve fixed optimizer's rank-major incoming-edge priority. Ordering of
  * sources tied at one rank is unspecified in both implementations because
  * the fixed reverse kernel also atomically appends source IDs. */
+template<bool Packed>
 __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const size_t* offsets,
                               const unsigned* sources, const uint8_t* incoming_ranks) {
   __shared__ unsigned hist[degree], cursors[degree], starts[degree], reverse[degree];
@@ -265,7 +272,7 @@ __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const siz
   __syncthreads();
   const size_t begin = offsets[row];
   for (unsigned j = threadIdx.x; j < counts[row]; j += blockDim.x)
-    atomicAdd(hist + incoming_ranks[begin + j], 1u);
+    atomicAdd(hist + (Packed ? sources[begin + j] >> 24 : incoming_ranks[begin + j]), 1u);
   __syncthreads();
   if (threadIdx.x < degree) {
     unsigned sum = 0;
@@ -274,9 +281,9 @@ __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const siz
   }
   __syncthreads();
   for (unsigned j = threadIdx.x; j < counts[row]; j += blockDim.x) {
-    const unsigned rank = incoming_ranks[begin + j];
+    const unsigned rank = Packed ? sources[begin + j] >> 24 : incoming_ranks[begin + j];
     const unsigned pos = starts[rank] + atomicAdd(cursors + rank, 1u);
-    if (pos < degree) reverse[pos] = sources[begin + j];
+    if (pos < degree) reverse[pos] = Packed ? sources[begin + j] & 0x00ffffffu : sources[begin + j];
   }
   __syncthreads();
   const unsigned remaining = min(counts[row], degree);
@@ -392,7 +399,10 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   BatchEvents batch_events;
   if (!batch_events.create((size_t(rows) + batch - 1) / batch)) return 1;
 #endif
-  if (!knn.allocate(size_t(rows) * input_degree * sizeof(unsigned)) ||
+  const bool packed_knn = seekdb_knn_use_u24(rows64);
+  size_t knn_bytes = 0;
+  if (!seekdb_knn_storage_size(size_t(rows), input_degree, packed_knn, &knn_bytes)) return 1;
+  if (!knn.allocate(knn_bytes) ||
       !candidates.allocate(size_t(batch) * candidate_k * sizeof(int64_t)) ||
       !candidate_distances.allocate(size_t(batch) * candidate_k * sizeof(float)) ||
       !errors.allocate(sizeof(unsigned)) ||
@@ -412,9 +422,15 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
 #if SEEKDB_IVFPQ_BATCH_EVENTS
     if (hipEventRecord(events[1], stream) != hipSuccess) return 1;
 #endif
-    hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity>), dim3(count), dim3(256), 0, stream,
-                       dataset_ptr, dim, candidates.as<int64_t>(), candidate_k,
-                       count, offset, rows, knn.as<unsigned>(), errors.as<unsigned>());
+    if (packed_knn) {
+      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, true>), dim3(count), dim3(256), 0, stream,
+                         dataset_ptr, dim, candidates.as<int64_t>(), candidate_k,
+                         count, offset, rows, knn.as<unsigned>(), errors.as<unsigned>());
+    } else {
+      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, false>), dim3(count), dim3(256), 0, stream,
+                         dataset_ptr, dim, candidates.as<int64_t>(), candidate_k,
+                         count, offset, rows, knn.as<unsigned>(), errors.as<unsigned>());
+    }
     if (!gpu_ok()) return 1;
 #if SEEKDB_IVFPQ_BATCH_EVENTS
     if (hipEventRecord(events[2], stream) != hipSuccess) return 1;
@@ -427,22 +443,33 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   ivf.reset();
   candidates.reset(); candidate_distances.reset();
   if (!graph.allocate(size_t(rows) * degree * sizeof(unsigned)) || !timer.start(stream)) return 1;
-  hipLaunchKernelGGL(prune_graph, dim3(rows), dim3(256), 0, stream, knn.as<unsigned>(), rows, graph.as<unsigned>());
+  if (packed_knn)
+    hipLaunchKernelGGL((prune_graph<true>), dim3(rows), dim3(256), 0, stream, knn.as<unsigned>(), rows, graph.as<unsigned>());
+  else
+    hipLaunchKernelGGL((prune_graph<false>), dim3(rows), dim3(256), 0, stream, knn.as<unsigned>(), rows, graph.as<unsigned>());
   if (!gpu_ok() || !timer.report("detour_prune", stream)) return 1;
   knn.reset();
   const size_t edges = size_t(rows) * degree;
+  // Store source[23:0] + original rank[31:24] only when both are lossless.
+  // Other shapes retain the original independent uint32/uint8 CSR arrays.
+  const bool packed_reverse = rows64 <= (int64_t(1) << 24) && degree <= 256;
   const unsigned prefix_blocks_count = unsigned((size_t(rows) + 255) / 256);
   if (!counts.allocate(size_t(rows) * sizeof(unsigned)) || !offsets.allocate(size_t(rows) * sizeof(size_t)) ||
       !block_offsets.allocate(size_t(prefix_blocks_count) * sizeof(size_t)) ||
       !cursors.allocate(size_t(rows) * sizeof(unsigned)) || !sources.allocate(edges * sizeof(unsigned)) ||
-      !incoming_ranks.allocate(edges) || hipMemsetAsync(counts.pointer, 0, size_t(rows) * sizeof(unsigned), stream) != hipSuccess ||
+      (!packed_reverse && !incoming_ranks.allocate(edges)) || hipMemsetAsync(counts.pointer, 0, size_t(rows) * sizeof(unsigned), stream) != hipSuccess ||
       hipMemsetAsync(cursors.pointer, 0, size_t(rows) * sizeof(unsigned), stream) != hipSuccess || !timer.start(stream)) return 1;
   hipLaunchKernelGGL(count_incoming, dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, counts.as<unsigned>());
   hipLaunchKernelGGL(prefix_blocks, dim3(prefix_blocks_count), dim3(1), 0, stream, counts.as<unsigned>(), offsets.as<size_t>(), block_offsets.as<size_t>(), rows);
   hipLaunchKernelGGL(prefix_block_totals, dim3(1), dim3(1), 0, stream, block_offsets.as<size_t>(), prefix_blocks_count);
   hipLaunchKernelGGL(add_block_offsets, dim3(prefix_blocks_count), dim3(256), 0, stream, offsets.as<size_t>(), block_offsets.as<size_t>(), rows);
-  hipLaunchKernelGGL(transpose_graph, dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, offsets.as<size_t>(), cursors.as<unsigned>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
-  hipLaunchKernelGGL(merge_reverse, dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
+  if (packed_reverse) {
+    hipLaunchKernelGGL((transpose_graph<true>), dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, offsets.as<size_t>(), cursors.as<unsigned>(), sources.as<unsigned>(), nullptr);
+    hipLaunchKernelGGL((merge_reverse<true>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), nullptr);
+  } else {
+    hipLaunchKernelGGL((transpose_graph<false>), dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, offsets.as<size_t>(), cursors.as<unsigned>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
+    hipLaunchKernelGGL((merge_reverse<false>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
+  }
   if (!gpu_ok() || !timer.report("reverse_csr_merge", stream)) return 1;
   counts.reset(); offsets.reset(); block_offsets.reset(); cursors.reset(); sources.reset(); incoming_ranks.reset();
   if (!timer.start(stream)) return 1;
