@@ -232,7 +232,10 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
         break;
       }
     }
-    ob_usleep(100L * 1000L);
+    // A successful checksum report is synchronous; only retain the failure-path delay.
+    if (OB_SUCCESS != ret) {
+      ob_usleep(100L * 1000L);
+    }
   }
   return ret;
 }

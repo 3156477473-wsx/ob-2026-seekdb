@@ -401,7 +401,7 @@ int ObHNSWSerializeCallback::operator()(const char *data, const int64_t data_siz
     LOG_WARN("get lob manager nullptr", K(ret));
   } else if (OB_FAIL(lob_mngr->append(lob_param, src_lob))) {
   } else {
-    LOG_INFO("[vec index debug] success write one data into lob tablet", K(src_lob),
+    LOG_INFO("successfully wrote vector index snapshot chunk", K(data_size),
               K(lob_param.lob_meta_tablet_id_), KPC(lob_param.tx_desc_));
     ObString dest_str(lob_param.handle_size_, (char*)lob_param.lob_common_);
     if (OB_FAIL(vctx->get_vals().push_back(dest_str))) {

@@ -563,7 +563,10 @@ int ObTabletDirectLoadMgrV3::close()
           break;
         }
       }
-      ob_usleep(100L * 1000L);
+      // The checksum is already recorded on success; no post-success backoff is needed.
+      if (OB_SUCCESS != ret) {
+        ob_usleep(100L * 1000L);
+      }
     }
   }
   return ret;
