@@ -14,6 +14,18 @@
 #include <stdint.h>
 #include <string.h>
 #include <float.h>
+#ifdef __cplusplus
+#include <mutex>
+/* The pool changes the process-wide current MR during graph construction. */
+static std::recursive_mutex sk_cuvs_sdk_mutex;
+#define SK_CUVS_SDK_GUARD() \
+  std::lock_guard<std::recursive_mutex> sk_cuvs_sdk_guard(sk_cuvs_sdk_mutex)
+#elif defined(__HIP_PLATFORM_AMD__)
+#error "The HIP bridge requires C++ SDK serialization; use the supplied build.sh"
+#else
+/* Preserve the non-HIP, CPU-only C fake used by the file/ownership tests. */
+#define SK_CUVS_SDK_GUARD() ((void)0)
+#endif
 
 typedef struct {
   cuvsResources_t        res;
@@ -26,6 +38,7 @@ typedef struct {
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
+  SK_CUVS_SDK_GUARD();
   if (!base || n <= 0 || dim <= 0 ||
       (size_t)n > SIZE_MAX / sizeof(float) / (size_t)dim) return NULL;
   const size_t base_bytes = (size_t)n * (size_t)dim * sizeof(float);
@@ -78,6 +91,7 @@ fail_base: if (h->base_device) cudaFree(h->base_device);
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                        unsigned int* out_ids, float* out_dist)
 {
+  SK_CUVS_SDK_GUARD();
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h || !h->idx) return 1;
   int rc = 0;
@@ -116,6 +130,7 @@ done:
 
 void seekdb_cuvs_free(void* handle)
 {
+  SK_CUVS_SDK_GUARD();
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
   (void)cuvsStreamSync(h->res);
@@ -231,6 +246,7 @@ static int sk_snapshot_read_gpu(FILE* file, unsigned char* buffer, void* output,
 
 int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
+  SK_CUVS_SDK_GUARD();
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h || !h->idx || !filename || h->n <= 0 || h->dim <= 0 ||
       (uint64_t)h->n > UINT32_MAX || !sk_snapshot_platform()) return 1;
@@ -282,6 +298,7 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 {
+  SK_CUVS_SDK_GUARD();
   if (!filename || n <= 0 || dim <= 0) return NULL;
   FILE* file = fopen(filename, "rb");
   if (!file) return NULL;
@@ -369,6 +386,7 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 
 int seekdb_cuvs_copy_dataset(void* handle, float* out_base, long n, long dim)
 {
+  SK_CUVS_SDK_GUARD();
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h || !h->idx || !out_base || n <= 0 || dim <= 0 || h->n != n || h->dim != dim ||
       (size_t)n > SIZE_MAX / sizeof(float) / (size_t)dim) return 1;
@@ -434,6 +452,7 @@ int seekdb_cuvs_cagra_knn(const float* base, long n, long dim,
                           const float* query, long nq, long topk,
                           unsigned int* out_ids)
 {
+  SK_CUVS_SDK_GUARD();
   void* h = seekdb_cuvs_build(base, n, dim);
   if (!h) return 10;
   int rc = seekdb_cuvs_search(h, query, nq, topk, out_ids, NULL);

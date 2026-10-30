@@ -4,6 +4,7 @@
  * construction, with all graph transforms performed on the GPU.
  * No SDK C++ types, private symbols, global allocator or search replacement. */
 #include "ivfpq_graph.h"
+#include "knn_staging.h"
 #include <cuvs/neighbors/ivf_pq.h>
 #include <hip/hip_runtime.h>
 #include <hip/library_types.h>
@@ -31,7 +32,7 @@
 #define SEEKDB_IVFPQ_BATCH 1024
 #endif
 #ifndef SEEKDB_IVFPQ_INTERNAL_BATCH
-#define SEEKDB_IVFPQ_INTERNAL_BATCH 128
+#define SEEKDB_IVFPQ_INTERNAL_BATCH 512
 #endif
 #ifndef SEEKDB_IVFPQ_INTERMEDIATE
 #define SEEKDB_IVFPQ_INTERMEDIATE 192
@@ -59,6 +60,17 @@ struct DeviceMemory {
   template<class T> T* as() const { return static_cast<T*>(pointer); }
   unsigned* release_graph() { unsigned* p = as<unsigned>(); pointer = nullptr; return p; }
 };
+struct PinnedHostMemory {
+  void* pointer = nullptr;
+  PinnedHostMemory() = default;
+  PinnedHostMemory(const PinnedHostMemory&) = delete;
+  PinnedHostMemory& operator=(const PinnedHostMemory&) = delete;
+  ~PinnedHostMemory() { reset(); }
+  bool allocate(size_t bytes) {
+    return !pointer && bytes && hipHostMalloc(&pointer, bytes, hipHostMallocDefault) == hipSuccess;
+  }
+  void reset() { if (pointer) hipHostFree(pointer); pointer = nullptr; }
+};
 struct IvfObjects {
   cuvsIvfPqIndex_t index = nullptr;
   cuvsIvfPqIndexParams_t build = nullptr;
@@ -69,6 +81,71 @@ struct IvfObjects {
     if (search) cuvsIvfPqSearchParamsDestroy(search);
     if (build) cuvsIvfPqIndexParamsDestroy(build);
     index = nullptr; search = nullptr; build = nullptr;
+  }
+};
+// Index storage uses the current default MR, independently of this handle.
+// Release training-only BLAS/workspace resources before starting the search pool.
+struct ScopedTrainingResource {
+  hipStream_t stream;
+  cuvsResources_t handle = 0;
+  explicit ScopedTrainingResource(hipStream_t s) : stream(s) {}
+  ScopedTrainingResource(const ScopedTrainingResource&) = delete;
+  ScopedTrainingResource& operator=(const ScopedTrainingResource&) = delete;
+  ~ScopedTrainingResource() { (void)finish(); }
+  bool start() {
+    return cuvsResourcesCreate(&handle) == CUVS_SUCCESS &&
+           cuvsStreamSet(handle, reinterpret_cast<cudaStream_t>(stream)) == CUVS_SUCCESS;
+  }
+  bool finish() {
+    if (!handle) return true;
+    bool ok = hipStreamSynchronize(stream) == hipSuccess;
+    const cuvsResources_t closing = handle;
+    handle = 0;
+    ok = (cuvsResourcesDestroy(closing) == CUVS_SUCCESS) && ok;
+    ok = (hipStreamSynchronize(stream) == hipSuccess) && ok;
+    if (!ok) fprintf(stderr, "[seekdb_cuvs] ivfpq training resource cleanup failed\n");
+    return ok;
+  }
+};
+// This scope owns only search temporaries. The training resource keeps its old MR.
+struct ScopedSearchPool {
+  cuvsResources_t original;
+  hipStream_t stream;
+  cuvsResources_t search = 0;
+  bool enabled = false;
+  ScopedSearchPool(cuvsResources_t res, hipStream_t s) : original(res), stream(s) {}
+  ScopedSearchPool(const ScopedSearchPool&) = delete;
+  ScopedSearchPool& operator=(const ScopedSearchPool&) = delete;
+  ~ScopedSearchPool() { (void)finish(); }
+  bool start() {
+    if (cuvsRMMPoolMemoryResourceEnable(0, 1, false) != CUVS_SUCCESS) {
+      const char* error = cuvsGetLastErrorText();
+      fprintf(stderr, "[seekdb_cuvs] ivfpq search pool unavailable; using original resource: %s\n",
+              error ? error : "no SDK error text");
+      return true; // Do not reset or replace an existing upstream MR.
+    }
+    enabled = true;
+    // The training handle already cached its workspace MR. Use a fresh handle.
+    return cuvsResourcesCreate(&search) == CUVS_SUCCESS &&
+           cuvsStreamSet(search, reinterpret_cast<cudaStream_t>(stream)) == CUVS_SUCCESS;
+  }
+  cuvsResources_t resource() const { return enabled ? search : original; }
+  bool finish() {
+    if (!enabled) return true;
+    const char* error = cuvsGetLastErrorText();
+    if (error) fprintf(stderr, "[seekdb_cuvs] ivfpq pool cleanup after SDK error: %s\n", error);
+    bool ok = hipStreamSynchronize(stream) == hipSuccess;
+    if (search) {
+      const cuvsResources_t closing = search;
+      search = 0;
+      ok = (cuvsResourcesDestroy(closing) == CUVS_SUCCESS) && ok;
+    }
+    // Resource destruction may enqueue deallocation work on the borrowed stream.
+    ok = (hipStreamSynchronize(stream) == hipSuccess) && ok;
+    ok = (cuvsRMMMemoryResourceReset() == CUVS_SUCCESS) && ok;
+    enabled = false;
+    if (!ok) fprintf(stderr, "[seekdb_cuvs] ivfpq search pool cleanup failed\n");
+    return ok;
   }
 };
 struct Timer {
@@ -363,10 +440,15 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   if (cuvsStreamGet(res, &cuda_stream) != CUVS_SUCCESS) return 1;
   const hipStream_t stream = reinterpret_cast<hipStream_t>(cuda_stream);
   Timer timer;
-  DeviceMemory upload, knn, graph, candidates, candidate_distances;
+  DeviceMemory upload, knn, batch_knn, graph, candidates, candidate_distances;
   DeviceMemory errors, counts, offsets, block_offsets, cursors, sources, incoming_ranks;
+  // Declared before StreamFence: all queued DMA finishes before host destruction,
+  // including every early return and exception from an SDK call.
+  PinnedHostMemory host_knn;
+  ScopedTrainingResource training{stream};
   IvfObjects ivf;
   StreamFence fence{stream};
+  if (!training.start()) return 1;
   float* dataset_ptr = static_cast<float*>(input.data);
   if (input.device.device_type == kDLCPU) {
     if (!upload.allocate(size_t(rows) * size_t(dim) * sizeof(float)) ||
@@ -399,8 +481,9 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
           input_degree, degree, rows, (long long)dim, ivf.build->n_lists);
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu internal_batch=%u batch_events=%u memory_info=%u\n",
           unsigned(SEEKDB_IVFPQ_INTERNAL_BATCH), unsigned(SEEKDB_IVFPQ_BATCH_EVENTS), unsigned(SEEKDB_IVFPQ_MEMORY_INFO));
-  if (cuvsIvfPqBuild(res, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
+  if (cuvsIvfPqBuild(training.handle, ivf.build, &dataset, ivf.index) != CUVS_SUCCESS ||
       !timer.report("pq_train_build", stream)) return 1;
+  if (!training.finish()) return 1;
   const unsigned batch = std::min(unsigned(SEEKDB_IVFPQ_BATCH), rows);
   const unsigned candidate_k = std::min(rows, std::max(input_degree + 1, input_degree * unsigned(SEEKDB_IVFPQ_REFINEMENT)));
   fprintf(stderr, "[seekdb_cuvs] ivfpq_gpu candidate_k=%u shared_capacity=%u shared_bytes=%zu dtype=FP32\n",
@@ -410,14 +493,22 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   if (!batch_events.create((size_t(rows) + batch - 1) / batch)) return 1;
 #endif
   const bool packed_knn = seekdb_knn_use_u24(rows64);
-  size_t knn_bytes = 0;
-  if (!seekdb_knn_storage_size(size_t(rows), input_degree, packed_knn, &knn_bytes)) return 1;
-  if (!knn.allocate(knn_bytes) ||
+  size_t knn_bytes = 0, batch_knn_bytes = 0;
+  if (!seekdb_knn_storage_size(size_t(rows), input_degree, packed_knn, &knn_bytes) ||
+      !seekdb_knn_storage_size(size_t(batch), input_degree, packed_knn, &batch_knn_bytes)) return 1;
+  // Refinement consumes only one batch's output. Defer the complete GPU kNN
+  // graph until the pooled-search workspace is synchronized and destroyed.
+  if (!host_knn.allocate(knn_bytes) || !batch_knn.allocate(batch_knn_bytes) ||
       !candidates.allocate(size_t(batch) * candidate_k * sizeof(int64_t)) ||
       !candidate_distances.allocate(size_t(batch) * candidate_k * sizeof(float)) ||
       !errors.allocate(sizeof(unsigned)) ||
       hipMemsetAsync(errors.pointer, 0, sizeof(unsigned), stream) != hipSuccess ||
       !timer.start(stream)) return 1;
+  // FP32 coarse search uses the original index views, not mutable half/int8 caches.
+  if (ivf.search->coarse_search_dtype != HIP_R_32F ||
+      ivf.search->lut_dtype != HIP_R_32F || ivf.search->internal_distance_dtype != HIP_R_32F) return 1;
+  ScopedSearchPool search_pool{res, stream};
+  if (!search_pool.start()) return 1;
   for (unsigned offset = 0; offset < rows; offset += batch) {
     const unsigned count = std::min(batch, rows - offset);
     int64_t qs[2] = {count, dim}, cs[2] = {count, candidate_k};
@@ -428,20 +519,31 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
     auto& events = batch_events.values[offset / batch];
     if (hipEventRecord(events[0], stream) != hipSuccess) return 1;
 #endif
-    if (cuvsIvfPqSearch(res, ivf.search, ivf.index, &queries, &neighbors, &distances) != CUVS_SUCCESS) return 1;
+    if (cuvsIvfPqSearch(search_pool.resource(), ivf.search, ivf.index, &queries, &neighbors, &distances) != CUVS_SUCCESS) return 1;
 #if SEEKDB_IVFPQ_BATCH_EVENTS
     if (hipEventRecord(events[1], stream) != hipSuccess) return 1;
 #endif
     if (packed_knn) {
-      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, true>), dim3(count), dim3(256), 0, stream,
+      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, true, true>), dim3(count), dim3(256), 0, stream,
                          dataset_ptr, dim, candidates.as<int64_t>(), candidate_k,
-                         count, offset, rows, knn.as<unsigned>(), errors.as<unsigned>());
+                         count, offset, rows, batch_knn.as<unsigned>(), errors.as<unsigned>());
     } else {
-      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, false>), dim3(count), dim3(256), 0, stream,
+      hipLaunchKernelGGL((seekdb_refine_candidate_graph_l2<input_degree, candidate_capacity, false, true>), dim3(count), dim3(256), 0, stream,
                          dataset_ptr, dim, candidates.as<int64_t>(), candidate_k,
-                         count, offset, rows, knn.as<unsigned>(), errors.as<unsigned>());
+                         count, offset, rows, batch_knn.as<unsigned>(), errors.as<unsigned>());
     }
     if (!gpu_ok()) return 1;
+    seekdb_hipvs::KnnCopySlice slices[2];
+    unsigned slice_count = 0;
+    if (!seekdb_hipvs::make_knn_copy_slices(rows, input_degree, offset, count,
+                                          packed_knn, slices, slice_count)) return 1;
+    for (unsigned i = 0; i < slice_count; ++i) {
+      if (hipMemcpyAsync(static_cast<unsigned char*>(host_knn.pointer) + slices[i].host_offset,
+                         static_cast<unsigned char*>(batch_knn.pointer) + slices[i].device_offset,
+                         slices[i].bytes, hipMemcpyDeviceToHost, stream) != hipSuccess) return 1;
+    }
+    // Same-stream order prevents the next refinement from overwriting a batch
+    // before both of its lossless ID planes have been copied to host storage.
 #if SEEKDB_IVFPQ_BATCH_EVENTS
     if (hipEventRecord(events[2], stream) != hipSuccess) return 1;
 #endif
@@ -450,8 +552,15 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
 #if SEEKDB_IVFPQ_BATCH_EVENTS
   if (!batch_events.report()) return 1;
 #endif
+  if (!search_pool.finish()) return 1;
   ivf.reset();
   candidates.reset(); candidate_distances.reset();
+  batch_knn.reset();
+  if (!knn.allocate(knn_bytes) || !timer.start(stream) ||
+      hipMemcpyAsync(knn.pointer, host_knn.pointer, knn_bytes, hipMemcpyHostToDevice, stream) != hipSuccess ||
+      !timer.report("knn_restore", stream)) return 1;
+  // timer.report synchronizes the copy before freeing its pinned source.
+  host_knn.reset();
   if (!graph.allocate(size_t(rows) * degree * sizeof(unsigned)) || !timer.start(stream)) return 1;
   if (packed_knn)
     hipLaunchKernelGGL((prune_graph<true>), dim3(rows), dim3(256), 0, stream, knn.as<unsigned>(), rows, graph.as<unsigned>());

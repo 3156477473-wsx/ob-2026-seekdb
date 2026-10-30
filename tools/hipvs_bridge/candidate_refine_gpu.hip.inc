@@ -44,7 +44,8 @@ __device__ inline unsigned seekdb_knn_load(const unsigned* storage, size_t entri
   } else return storage[at];
 }
 
-template <unsigned OutputDegree, unsigned MaxCandidates = 1024, bool PackedIds = false>
+template <unsigned OutputDegree, unsigned MaxCandidates = 1024, bool PackedIds = false,
+          bool BatchOutput = false>
 __global__ void seekdb_refine_candidate_graph_l2(
     const float* dataset,
     int64_t dim,
@@ -73,8 +74,10 @@ __global__ void seekdb_refine_candidate_graph_l2(
     return;
   }
   const unsigned self = unsigned(self64);
-  const size_t entries = size_t(nrows) * OutputDegree;
-  const size_t output = size_t(self) * OutputDegree;
+  // The staging variant changes only the output address. Candidate IDs,
+  // self-exclusion and every FP32 distance still use global dataset rows.
+  const size_t entries = size_t(BatchOutput ? rows_count : nrows) * OutputDegree;
+  const size_t output = size_t(BatchOutput ? row : self) * OutputDegree;
   for (unsigned i = threadIdx.x; i < OutputDegree; i += blockDim.x)
     seekdb_knn_store<PackedIds>(graph, entries, output + i, UINT32_MAX);
   unsigned padded = 1;
