@@ -218,12 +218,48 @@ __global__ void transpose_graph(const unsigned* graph, size_t edges, const size_
     ranks[slot] = uint8_t(i % degree);
   }
 }
+__device__ void reverse_set_insert(unsigned* keys, unsigned mask, unsigned value) {
+  unsigned slot = (value * 2654435761u) & mask;
+  for (;;) {
+    const unsigned previous = atomicCAS(keys + slot, UINT32_MAX, value);
+    if (previous == UINT32_MAX || previous == value) return;
+    slot = (slot + 1) & mask;
+  }
+}
+__device__ bool reverse_set_contains(const unsigned* keys, unsigned mask, unsigned value) {
+  unsigned slot = (value * 2654435761u) & mask;
+  while (keys[slot] != UINT32_MAX) {
+    if (keys[slot] == value) return true;
+    slot = (slot + 1) & mask;
+  }
+  return false;
+}
+/* All256 block threads participate. HIP hardware waves are32 or64 lanes.
+ * Prefix includes earlier waves and earlier true lanes in this wave, hence
+ * stable order across the complete block, not merely within each wave. */
+__device__ unsigned reverse_stable_rank(bool selected, unsigned* wave_counts, unsigned& total) {
+  const unsigned lane = threadIdx.x % unsigned(warpSize);
+  const unsigned wave = threadIdx.x / unsigned(warpSize);
+  const unsigned waves = blockDim.x / unsigned(warpSize);
+  const unsigned long long votes = __ballot(selected);
+  if (lane == 0) wave_counts[wave] = unsigned(__popcll(votes));
+  __syncthreads();
+  unsigned rank = unsigned(__popcll(votes & ((1ull << lane) - 1ull)));
+  total = 0;
+  for (unsigned w = 0; w < waves; ++w) {
+    if (w < wave) rank += wave_counts[w];
+    total += wave_counts[w];
+  }
+  return rank;
+}
 /* Preserve fixed optimizer's rank-major incoming-edge priority. Ordering of
  * sources tied at one rank is unspecified in both implementations because
  * the fixed reverse kernel also atomically appends source IDs. */
 __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const size_t* offsets,
                               const unsigned* sources, const uint8_t* incoming_ranks) {
   __shared__ unsigned hist[degree], cursors[degree], starts[degree], reverse[degree];
+  __shared__ unsigned original[degree], protected_keys[degree], reverse_keys[degree * 2];
+  __shared__ unsigned wave_counts[8];
   const unsigned row = blockIdx.x;
   if (threadIdx.x < degree) { hist[threadIdx.x] = 0; cursors[threadIdx.x] = 0; reverse[threadIdx.x] = UINT32_MAX; }
   __syncthreads();
@@ -243,17 +279,35 @@ __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const siz
     if (pos < degree) reverse[pos] = sources[begin + j];
   }
   __syncthreads();
-  if (threadIdx.x) return;
+  const unsigned remaining = min(counts[row], degree);
+  if (!remaining) return;
   unsigned* out = graph + size_t(row) * degree;
-  unsigned remaining = min(counts[row], degree);
-  while (remaining) {
-    const unsigned candidate = reverse[--remaining];
-    unsigned pos = 0;
-    while (pos < degree && out[pos] != candidate) ++pos;
-    if (pos < degree / 2) continue;
-    if (pos >= degree) pos = degree - 1;
-    for (unsigned j = pos; j > degree / 2; --j) out[j] = out[j - 1];
-    out[degree / 2] = candidate;
+  if (threadIdx.x < degree) {
+    original[threadIdx.x] = out[threadIdx.x];
+    protected_keys[threadIdx.x] = UINT32_MAX;
+  }
+  for (unsigned j = threadIdx.x; j < degree * 2; j += blockDim.x) reverse_keys[j] = UINT32_MAX;
+  __syncthreads();
+  if (threadIdx.x < degree / 2)
+    reverse_set_insert(protected_keys, degree - 1, original[threadIdx.x]);
+  if (threadIdx.x < remaining)
+    reverse_set_insert(reverse_keys, degree * 2 - 1, reverse[threadIdx.x]);
+  __syncthreads();
+  const bool use_reverse = threadIdx.x < remaining &&
+      !reverse_set_contains(protected_keys, degree - 1, reverse[threadIdx.x]);
+  unsigned reverse_count = 0;
+  const unsigned reverse_rank = reverse_stable_rank(use_reverse, wave_counts, reverse_count);
+  if (use_reverse && reverse_rank < degree / 2)
+    out[degree / 2 + reverse_rank] = reverse[threadIdx.x];
+  // Every thread has consumed the first scan's wave_counts before reuse.
+  __syncthreads();
+  if (reverse_count < degree / 2) {
+    const bool use_original = threadIdx.x < degree / 2 &&
+        !reverse_set_contains(reverse_keys, degree * 2 - 1, original[degree / 2 + threadIdx.x]);
+    unsigned unused_total = 0;
+    const unsigned original_rank = reverse_stable_rank(use_original, wave_counts, unused_total);
+    if (use_original && reverse_count + original_rank < degree / 2)
+      out[degree / 2 + reverse_count + original_rank] = original[degree / 2 + threadIdx.x];
   }
 }
 __global__ void validate_graph(const unsigned* graph, unsigned rows, unsigned* errors) {
