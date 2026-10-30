@@ -34,6 +34,27 @@ does not replace the `lib=vsag` CPU implementation. The production build entry
 remains `bash tools/hipvs_bridge/build.sh [OUTPUT_SO]` and needs only the fixed
 SDK's public C headers and the installed ROCm toolchain, without new downloads.
 
+Before reserializing a reloaded index with 16-byte-aligned FP32 rows, the bridge
+copies the public dataset and graph views into its own `cudaMalloc` buffers and
+wraps the exact copied graph through `cuvsCagraIndexFromArgs(L2Expanded)`. Copies
+use explicit device-to-device direction, validate shapes, dtype, strides, byte
+offset and overflow, and finish before the old index is destroyed. The new index
+borrows both buffers until bridge destruction. This avoids an observed fixed-SDK
+reload/reserialize path that could return success while writing incorrect dataset
+bytes; synchronization alone did not consistently prevent it. It does not claim
+that the SDK's underlying defect has been identified.
+
+Fresh aligned builds already own their dataset and skip this copy, so their
+construction and first-serialization paths are unchanged. Unaligned dimensions
+retain their existing SDK serialization path: the public row-major `FromArgs`
+would introduce another SDK-owned padded dataset there. A failed replacement
+keeps the original index until the final destruction boundary; a destruction
+error invalidates the published handle rather than allowing a dangling index to
+be reused. Unknown failed-destructor storage is conservatively retained until
+process cleanup. The extra transient GPU storage is one logical FP32 dataset
+plus one uint32 graph, and SDK pool retention may increase the measured peak.
+New complete native-file/FP32, full SQL/reopen and VRAM validation is required.
+
 The build script explicitly selects the AMD platform and `gfx1100`, the
 competition's Radeon PRO W7900D target. Compiling on a host without a visible GPU
 does not change this target. For development on another AMD architecture, set

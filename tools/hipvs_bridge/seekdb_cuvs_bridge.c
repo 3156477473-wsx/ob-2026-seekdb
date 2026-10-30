@@ -78,7 +78,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                        unsigned int* out_ids, float* out_dist)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
-  if (!h) return 1;
+  if (!h || !h->idx) return 1;
   int rc = 0;
   float* qd = 0; unsigned* nd = 0; float* dd = 0; cuvsCagraSearchParams_t sp = 0;
   if (cuvsRMMAlloc(h->res, (void**)&qd, sizeof(float)*nq*h->dim)  != CUVS_SUCCESS) { rc=10; goto done; }
@@ -118,7 +118,7 @@ void seekdb_cuvs_free(void* handle)
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
   (void)cuvsStreamSync(h->res);
-  cuvsCagraIndexDestroy(h->idx);
+  if (h->idx) cuvsCagraIndexDestroy(h->idx);
   if (h->graph_device) cudaFree(h->graph_device);
   if (h->base_device) cudaFree(h->base_device);
   cuvsCagraIndexParamsDestroy(h->ip);
@@ -126,10 +126,143 @@ void seekdb_cuvs_free(void* handle)
   free(h);
 }
 
+/* Copy logical GPU rows without host staging or cudaMemcpyDefault. GetDataset
+ * and GetGraph can expose padded rows and a byte offset; metadata is not GPU
+ * ownership. Validate the full source span before any allocation or copy. */
+static int sk_cuvs_snapshot_view(const DLManagedTensor* view, long n, int64_t dim,
+                                 uint8_t code, const unsigned char** source,
+                                 size_t* row_bytes, size_t* row_pitch)
+{
+  const DLTensor* t = &view->dl_tensor;
+  const int gpu = t->device.device_type == kDLCUDA
+#ifdef __HIP_PLATFORM_AMD__
+      || t->device.device_type == kDLROCM
+#endif
+      ;
+  if (!view->deleter || !t->data || !t->shape || t->ndim != 2 ||
+      t->shape[0] != n || t->shape[1] != dim || !gpu || t->device.device_id < 0 ||
+      t->dtype.code != code || t->dtype.bits != 32 || t->dtype.lanes != 1 ||
+      dim <= 0 || (uint64_t)dim > SIZE_MAX / 4 ||
+      (size_t)n > SIZE_MAX / ((size_t)dim * 4)) return 1;
+  const int64_t stride = t->strides ? t->strides[0] : dim;
+  if ((t->strides && t->strides[1] != 1) || stride < dim ||
+      (uint64_t)stride > SIZE_MAX / 4 || t->byte_offset > SIZE_MAX) return 1;
+  *row_bytes = (size_t)dim * 4;
+  *row_pitch = (size_t)stride * 4;
+  if ((size_t)(n - 1) > (SIZE_MAX - *row_bytes) / *row_pitch) return 1;
+  const size_t span = (size_t)(n - 1) * *row_pitch + *row_bytes;
+  const uintptr_t address = (uintptr_t)t->data;
+  const size_t offset = (size_t)t->byte_offset;
+  if (address > UINTPTR_MAX - offset || address + offset > UINTPTR_MAX - (span - 1)) return 1;
+  *source = (const unsigned char*)t->data + offset;
+  return 0;
+}
+
+static int sk_cuvs_snapshot_copy(void* output, const unsigned char* source,
+                                 long n, size_t row_bytes, size_t row_pitch)
+{
+  if (row_bytes == row_pitch)
+    return cudaMemcpy(output, source, (size_t)n * row_bytes, cudaMemcpyDeviceToDevice) != cudaSuccess;
+  for (size_t row = 0; row < (size_t)n; ++row)
+    if (cudaMemcpy((unsigned char*)output + row * row_bytes, source + row * row_pitch,
+                   row_bytes, cudaMemcpyDeviceToDevice) != cudaSuccess) return 1;
+  return 0;
+}
+
+/* The fixed SDK's reloaded dataset layout can serialize incorrect data even
+ * after a successful FP32 copy and stream sync. Rebind the exact dataset and
+ * graph to bridge-owned cudaMalloc buffers before reserialization. Fresh aligned
+ * builds already own their input and take no extra copy. Unaligned logical rows
+ * retain the SDK path: FromArgs would otherwise create another SDK padded copy. */
+static int sk_cuvs_snapshot_own_loaded(sk_cuvs_index* h)
+{
+  DLManagedTensor base_view = {0}, graph_view = {0};
+  DLManagedTensor base_tensor = {0}, graph_tensor = {0};
+  const unsigned char *base_source = NULL, *graph_source = NULL;
+  size_t base_row = 0, base_pitch = 0, graph_row = 0, graph_pitch = 0;
+  float* base = NULL;
+  unsigned int* graph = NULL;
+  cuvsCagraIndex_t replacement = NULL;
+  int64_t n = 0, dim = 0, degree = 0;
+  int64_t base_shape[2] = {h->n, h->dim}, graph_shape[2] = {h->n, 0};
+  int rc = 1;
+  if (h->base_device || (h->dim % 4) != 0) return 0;
+  if (!h->idx || h->n <= 0 || h->dim <= 0 || (uint64_t)h->n > UINT32_MAX) return 1;
+  do {
+    if (cuvsStreamSync(h->res) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetSize(h->idx, &n) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetDims(h->idx, &dim) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetGraphDegree(h->idx, &degree) != CUVS_SUCCESS ||
+        n != h->n || dim != h->dim || degree <= 0 ||
+        cuvsCagraIndexGetDataset(h->idx, &base_view) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetGraph(h->idx, &graph_view) != CUVS_SUCCESS) break;
+    if (sk_cuvs_snapshot_view(&base_view, h->n, h->dim, kDLFloat, &base_source, &base_row, &base_pitch) ||
+        sk_cuvs_snapshot_view(&graph_view, h->n, degree, kDLUInt, &graph_source, &graph_row, &graph_pitch) ||
+        base_view.dl_tensor.device.device_id != graph_view.dl_tensor.device.device_id) break;
+    if (cudaMalloc((void**)&base, (size_t)h->n * base_row) != cudaSuccess ||
+        cudaMalloc((void**)&graph, (size_t)h->n * graph_row) != cudaSuccess ||
+        sk_cuvs_snapshot_copy(base, base_source, h->n, base_row, base_pitch) ||
+        sk_cuvs_snapshot_copy(graph, graph_source, h->n, graph_row, graph_pitch) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        cuvsCagraIndexCreate(&replacement) != CUVS_SUCCESS) break;
+    base_tensor.dl_tensor = base_view.dl_tensor;
+    base_tensor.dl_tensor.data = base;
+    base_tensor.dl_tensor.device.device_type = kDLCUDA;
+    base_tensor.dl_tensor.shape = base_shape;
+    base_tensor.dl_tensor.strides = NULL;
+    base_tensor.dl_tensor.byte_offset = 0;
+    graph_shape[1] = degree;
+    graph_tensor.dl_tensor = graph_view.dl_tensor;
+    graph_tensor.dl_tensor.data = graph;
+    graph_tensor.dl_tensor.device.device_type = kDLCUDA;
+    graph_tensor.dl_tensor.shape = graph_shape;
+    graph_tensor.dl_tensor.strides = NULL;
+    graph_tensor.dl_tensor.byte_offset = 0;
+    /* This bridge constructs L2Expanded indexes; do not rebuild or reorder the
+     * copied graph. Index header dtype.lanes is not reliable after SDK reload;
+     * the actual public tensor views above must still report FP32/uint32 lanes1. */
+    if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &graph_tensor, &base_tensor, replacement) != CUVS_SUCCESS ||
+        !replacement->addr || cudaDeviceSynchronize() != cudaSuccess ||
+        cuvsCagraIndexGetSize(replacement, &n) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetDims(replacement, &dim) != CUVS_SUCCESS ||
+        cuvsCagraIndexGetGraphDegree(replacement, &degree) != CUVS_SUCCESS ||
+        n != h->n || dim != h->dim || degree != graph_shape[1]) break;
+    /* Destroy may fail after consuming its object. Clear the published pointer
+     * first so that no later search/copy/free can reuse a dangling old index.
+     * On that exceptional path retain old borrowed graph storage until process
+     * cleanup, rather than freeing memory a partially destroyed index may use. */
+    {
+      cuvsCagraIndex_t old = h->idx;
+      unsigned int* old_graph = h->graph_device;
+      h->idx = NULL;
+      h->graph_device = NULL;
+      if (cuvsCagraIndexDestroy(old) != CUVS_SUCCESS) break;
+      if (old_graph && cudaFree(old_graph) != cudaSuccess) break;
+    }
+    h->idx = replacement; replacement = NULL;
+    h->base_device = base; base = NULL;
+    h->graph_device = graph; graph = NULL;
+    rc = 0;
+  } while (0);
+  if (base_view.deleter) base_view.deleter(&base_view);
+  if (graph_view.deleter) graph_view.deleter(&graph_view);
+  if (replacement) {
+    (void)cudaDeviceSynchronize();
+    if (cuvsCagraIndexDestroy(replacement) != CUVS_SUCCESS) {
+      /* Unknown destruction state: never free buffers it might still borrow. */
+      base = NULL; graph = NULL;
+    }
+  }
+  if (graph) cudaFree(graph);
+  if (base) cudaFree(base);
+  if (rc) fprintf(stderr, "[seekdb_cuvs] snapshot ownership copy failed: %s\n", cuvsGetLastErrorText());
+  return rc;
+}
+
 int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
   sk_cuvs_index* index = (sk_cuvs_index*)handle;
-  if (!index || !filename) return 1;
+  if (!index || !index->idx || !filename || sk_cuvs_snapshot_own_loaded(index)) return 1;
   if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
     return 1;
@@ -175,7 +308,7 @@ fail:
 int seekdb_cuvs_copy_dataset(void* handle, float* out_base, long n, long dim)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
-  if (!h || !out_base || n <= 0 || dim <= 0 || h->n != n || h->dim != dim ||
+  if (!h || !h->idx || !out_base || n <= 0 || dim <= 0 || h->n != n || h->dim != dim ||
       (size_t)n > SIZE_MAX / sizeof(float) / (size_t)dim) return 1;
   DLManagedTensor view;
   memset(&view, 0, sizeof(view));
