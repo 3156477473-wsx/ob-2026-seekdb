@@ -34,6 +34,13 @@ does not replace the `lib=vsag` CPU implementation. The production build entry
 remains `bash tools/hipvs_bridge/build.sh [OUTPUT_SO]` and needs only the fixed
 SDK's public C headers and the installed ROCm toolchain, without new downloads.
 
+The build script explicitly selects the AMD platform and `gfx1100`, the
+competition's Radeon PRO W7900D target. Compiling on a host without a visible GPU
+does not change this target. For development on another AMD architecture, set
+`SEEKDB_HIP_ARCH` to its HIP target ID. The same target is passed to both source
+compilations and the final link; setting it only at link time cannot repair an
+object already compiled for another GPU.
+
 ## Verification and limits
 
 Development receipts and reproducible drivers are saved outside the repository

@@ -6,7 +6,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 HIPVS_ROOT=${HIPVS_ROOT:-/opt/hipvs}
 ROCM_ROOT=${ROCM_ROOT:-/opt/rocm}
 HIPCC=${HIPCC:-$ROCM_ROOT/bin/hipcc}
+HIP_ARCH=${SEEKDB_HIP_ARCH:-gfx1100}
 OUTPUT=${1:-$SCRIPT_DIR/libseekdb_cuvs_bridge.so}
+
+# The offline build host need not expose the competition GPU. Do not let HIPCC
+# infer a different device target (or platform) from the build host.
+export HIP_PLATFORM=amd
+ARCH_FLAGS=("--offload-arch=$HIP_ARCH")
 
 [[ -x "$HIPCC" ]] || { echo "hipcc is not executable: $HIPCC" >&2; exit 2; }
 [[ -f "$HIPVS_ROOT/include/cuvs/core/c_api.h" ]] || {
@@ -34,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 export TMPDIR="$BUILD_DIR"
-FLAGS=(-fPIC -O3 -std=c++17 -x hip -D__HIP_PLATFORM_AMD__
+FLAGS=("${ARCH_FLAGS[@]}" -fPIC -O3 -std=c++17 -x hip -D__HIP_PLATFORM_AMD__
        -I"$HIPVS_ROOT/include" -I"$ROCM_ROOT/include")
 
 "$HIPCC" "${FLAGS[@]}" \
@@ -45,6 +51,7 @@ FLAGS=(-fPIC -O3 -std=c++17 -x hip -D__HIP_PLATFORM_AMD__
   -c "$SCRIPT_DIR/ivfpq_graph.hip" -o "$BUILD_DIR/graph.o"
 
 "$HIPCC" \
+  "${ARCH_FLAGS[@]}" \
   -shared \
   "$BUILD_DIR/bridge.o" "$BUILD_DIR/graph.o" \
   -L"$HIPVS_ROOT/lib" \
@@ -54,4 +61,4 @@ FLAGS=(-fPIC -O3 -std=c++17 -x hip -D__HIP_PLATFORM_AMD__
   -o "$BUILD_DIR/libseekdb_cuvs_bridge.so"
 mv -- "$BUILD_DIR/libseekdb_cuvs_bridge.so" "$OUTPUT"
 
-echo "built $OUTPUT"
+echo "built $OUTPUT (HIP platform=amd, target=$HIP_ARCH)"
