@@ -31,7 +31,7 @@
 #define SEEKDB_IVFPQ_BATCH 1024
 #endif
 #ifndef SEEKDB_IVFPQ_INTERNAL_BATCH
-#define SEEKDB_IVFPQ_INTERNAL_BATCH 128
+#define SEEKDB_IVFPQ_INTERNAL_BATCH 192
 #endif
 #ifndef SEEKDB_IVFPQ_INTERMEDIATE
 #define SEEKDB_IVFPQ_INTERMEDIATE 192
@@ -224,11 +224,12 @@ __global__ void transpose_graph(const unsigned* graph, size_t edges, const size_
     if constexpr (!Packed) ranks[slot] = uint8_t(rank);
   }
 }
-__device__ void reverse_set_insert(unsigned* keys, unsigned mask, unsigned value) {
+__device__ bool reverse_set_insert(unsigned* keys, unsigned mask, unsigned value) {
   unsigned slot = (value * 2654435761u) & mask;
   for (;;) {
     const unsigned previous = atomicCAS(keys + slot, UINT32_MAX, value);
-    if (previous == UINT32_MAX || previous == value) return;
+    if (previous == UINT32_MAX) return true;
+    if (previous == value) return false;
     slot = (slot + 1) & mask;
   }
 }
@@ -263,10 +264,11 @@ __device__ unsigned reverse_stable_rank(bool selected, unsigned* wave_counts, un
  * the fixed reverse kernel also atomically appends source IDs. */
 template<bool Packed>
 __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const size_t* offsets,
-                              const unsigned* sources, const uint8_t* incoming_ranks) {
+                              const unsigned* sources, const uint8_t* incoming_ranks,
+                              unsigned rows, unsigned* errors) {
   __shared__ unsigned hist[degree], cursors[degree], starts[degree], reverse[degree];
-  __shared__ unsigned original[degree], protected_keys[degree], reverse_keys[degree * 2];
-  __shared__ unsigned wave_counts[8];
+  __shared__ unsigned original[degree], protected_keys[degree * 2], reverse_keys[degree * 2];
+  __shared__ unsigned wave_counts[8], row_invalid;
   const unsigned row = blockIdx.x;
   if (threadIdx.x < degree) { hist[threadIdx.x] = 0; cursors[threadIdx.x] = 0; reverse[threadIdx.x] = UINT32_MAX; }
   __syncthreads();
@@ -287,25 +289,32 @@ __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const siz
   }
   __syncthreads();
   const unsigned remaining = min(counts[row], degree);
-  if (!remaining) return;
   unsigned* out = graph + size_t(row) * degree;
   if (threadIdx.x < degree) {
     original[threadIdx.x] = out[threadIdx.x];
-    protected_keys[threadIdx.x] = UINT32_MAX;
+    // Histogram is dead after the incoming rank placement; reuse it for the final row.
+    hist[threadIdx.x] = original[threadIdx.x];
   }
-  for (unsigned j = threadIdx.x; j < degree * 2; j += blockDim.x) reverse_keys[j] = UINT32_MAX;
+  if (threadIdx.x == 0) row_invalid = 0;
+  for (unsigned j = threadIdx.x; j < degree * 2; j += blockDim.x) {
+    protected_keys[j] = UINT32_MAX;
+    reverse_keys[j] = UINT32_MAX;
+  }
   __syncthreads();
-  if (threadIdx.x < degree / 2)
-    reverse_set_insert(protected_keys, degree - 1, original[threadIdx.x]);
+  if (threadIdx.x < degree / 2) {
+    const unsigned value = original[threadIdx.x];
+    if (value >= rows || value == row) atomicOr(&row_invalid, 1u);
+    if (!reverse_set_insert(protected_keys, degree * 2 - 1, value)) atomicOr(&row_invalid, 1u);
+  }
   if (threadIdx.x < remaining)
     reverse_set_insert(reverse_keys, degree * 2 - 1, reverse[threadIdx.x]);
   __syncthreads();
   const bool use_reverse = threadIdx.x < remaining &&
-      !reverse_set_contains(protected_keys, degree - 1, reverse[threadIdx.x]);
+      !reverse_set_contains(protected_keys, degree * 2 - 1, reverse[threadIdx.x]);
   unsigned reverse_count = 0;
   const unsigned reverse_rank = reverse_stable_rank(use_reverse, wave_counts, reverse_count);
   if (use_reverse && reverse_rank < degree / 2)
-    out[degree / 2 + reverse_rank] = reverse[threadIdx.x];
+    hist[degree / 2 + reverse_rank] = reverse[threadIdx.x];
   // Every thread has consumed the first scan's wave_counts before reuse.
   __syncthreads();
   if (reverse_count < degree / 2) {
@@ -314,18 +323,19 @@ __global__ void merge_reverse(unsigned* graph, const unsigned* counts, const siz
     unsigned unused_total = 0;
     const unsigned original_rank = reverse_stable_rank(use_original, wave_counts, unused_total);
     if (use_original && reverse_count + original_rank < degree / 2)
-      out[degree / 2 + reverse_count + original_rank] = original[degree / 2 + threadIdx.x];
+      hist[degree / 2 + reverse_count + original_rank] = original[degree / 2 + threadIdx.x];
   }
-}
-__global__ void validate_graph(const unsigned* graph, unsigned rows, unsigned* errors) {
-  const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= rows) return;
-  const unsigned* values = graph + size_t(row) * degree;
-  for (unsigned k = 0; k < degree; ++k) {
-    if (values[k] >= rows || values[k] == row) { atomicAdd(errors, 1u); return; }
-    for (unsigned j = 0; j < k; ++j)
-      if (values[k] == values[j]) { atomicAdd(errors, 1u); return; }
+  // All original membership tests and final-row writes finish before reusing the set.
+  __syncthreads();
+  if (threadIdx.x < degree / 2) {
+    const unsigned value = hist[degree / 2 + threadIdx.x];
+    if (value >= rows || value == row) atomicOr(&row_invalid, 1u);
+    if (!reverse_set_insert(protected_keys, degree * 2 - 1, value)) atomicOr(&row_invalid, 1u);
   }
+  __syncthreads();
+  // Match the old validator: exactly one increment for each invalid output row.
+  if (threadIdx.x == 0 && row_invalid) atomicAdd(errors, 1u);
+  if (threadIdx.x < degree) out[threadIdx.x] = hist[threadIdx.x];
 }
 bool gpu_ok() {
   const hipError_t code = hipGetLastError();
@@ -465,16 +475,14 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   hipLaunchKernelGGL(add_block_offsets, dim3(prefix_blocks_count), dim3(256), 0, stream, offsets.as<size_t>(), block_offsets.as<size_t>(), rows);
   if (packed_reverse) {
     hipLaunchKernelGGL((transpose_graph<true>), dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, offsets.as<size_t>(), cursors.as<unsigned>(), sources.as<unsigned>(), nullptr);
-    hipLaunchKernelGGL((merge_reverse<true>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), nullptr);
+    hipLaunchKernelGGL((merge_reverse<true>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), nullptr, rows, errors.as<unsigned>());
   } else {
     hipLaunchKernelGGL((transpose_graph<false>), dim3(4096), dim3(256), 0, stream, graph.as<unsigned>(), edges, offsets.as<size_t>(), cursors.as<unsigned>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
-    hipLaunchKernelGGL((merge_reverse<false>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>());
+    hipLaunchKernelGGL((merge_reverse<false>), dim3(rows), dim3(256), 0, stream, graph.as<unsigned>(), counts.as<unsigned>(), offsets.as<size_t>(), sources.as<unsigned>(), incoming_ranks.as<uint8_t>(), rows, errors.as<unsigned>());
   }
-  if (!gpu_ok() || !timer.report("reverse_csr_merge", stream)) return 1;
+  if (!gpu_ok() || !timer.report("reverse_csr_merge_validate", stream)) return 1;
   counts.reset(); offsets.reset(); block_offsets.reset(); cursors.reset(); sources.reset(); incoming_ranks.reset();
-  if (!timer.start(stream)) return 1;
-  hipLaunchKernelGGL(validate_graph, dim3((rows + 127) / 128), dim3(128), 0, stream, graph.as<unsigned>(), rows, errors.as<unsigned>());
-  if (!gpu_ok() || graph_errors(errors, stream) || !timer.report("validate_graph", stream)) return 1;
+  if (graph_errors(errors, stream)) return 1;
   int64_t graph_shape[2] = {rows64, degree};
   DLManagedTensor gpu_graph = tensor(graph.pointer, graph_shape, kDLUInt, 32, device);
   if (!timer.start(stream) || cuvsCagraIndexFromArgs(res, params->metric, &gpu_graph, original, output) != CUVS_SUCCESS) return 1;
