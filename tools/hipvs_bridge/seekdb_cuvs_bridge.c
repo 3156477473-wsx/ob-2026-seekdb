@@ -110,7 +110,9 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
       size_t required_itopk = (size_t)topk * 4;
-      if (required_itopk < 512) required_itopk = 512;
+      /* Spend a larger fixed-library CAGRA search budget on graph-quality
+       * variation. The returned neighbors still come directly from that SDK. */
+      if (required_itopk < 640) required_itopk = 640;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
       sp->search_width = 4;
     }
