@@ -1,8 +1,10 @@
 # Batched kNN staging candidate
 
-Status: implementation candidate. CPU byte-layout checks passed; HIP compilation,
-actual GPU peak, Recall and end-to-end performance remain unverified for this
-version. Do not treat an allocation calculation as a passed memory gate.
+Status: implementation candidate. CPU byte-layout checks passed. HIP object
+compilation is recorded separately for each immutable source version; actual GPU
+peak, Recall and end-to-end performance remain unverified for the current
+quality-recovery configuration. Do not treat allocation arithmetic or object
+compilation as a passed runtime gate. See `RECALL-RECOVERY-2026.md`.
 
 ## Motivation
 
@@ -14,7 +16,8 @@ bytes. Refinement writes one batch at a time; it does not read earlier rows.
 
 ## Change
 
-Keep one1024-row output batch on the GPU:589,824 bytes for u24 IDs. After GPU
+Keep one1024-row output batch on the GPU. The initial192-edge configuration used
+589,824 bytes for u24 IDs; the current256-edge recovery uses786,432 bytes. After GPU
 FP32 refinement, copy the output to pinned host storage on the same HIP stream.
 Packed storage is a low16 plane followed by a high8 plane: copy each plane
 separately into its position in the complete host matrix, including a partial
@@ -29,7 +32,9 @@ Host staging performs byte transport and address calculation only. IVF-PQ,
 FP32 distance refinement, graph pruning, reverse-edge generation, and final
 CAGRA queries remain GPU operations. Original vectors, full ID bits, candidate
 counts, probes, refinement factor, native snapshot format and fixed SDK queries
-are unchanged. No data is omitted. All DMA and buffer allocation occur inside
+are preserved by the staging mechanism itself. The separate quality-recovery
+configuration increases intermediate edges and probes; it is not a claim that
+those parameters equal the prior submission. No data is omitted. All DMA and buffer allocation occur inside
 the normal timed index-construction path, before CREATE INDEX returns.
 
 The final validation path remains the fixed library's `cuvsCagraSearch` and its
@@ -54,7 +59,7 @@ actual returned IDs. This patch does not modify or replace hipVS/cuVS.
 `tests/test_knn_staging.cpp` runs without HIP. It independently encodes batches,
 uses the same copy-slice helper as the product, then decodes the complete matrix.
 It covers both storage formats, high ID bytes, sentinels, partial final batches,
-bounds/overflow guards and an exact250K x192 packed matrix. This tests byte
+bounds/overflow guards and exact250K x192 and250K x256 packed matrices. This tests byte
 transport only, not HIP kernels, SQL, Recall, physical VRAM or performance.
 
 Required next GPU run: compile the bridge and seekdb version metadata; run exact

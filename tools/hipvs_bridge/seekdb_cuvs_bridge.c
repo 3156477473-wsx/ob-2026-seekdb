@@ -20,10 +20,10 @@
 static std::recursive_mutex sk_cuvs_sdk_mutex;
 #define SK_CUVS_SDK_GUARD() \
   std::lock_guard<std::recursive_mutex> sk_cuvs_sdk_guard(sk_cuvs_sdk_mutex)
-#elif defined(__HIP_PLATFORM_AMD__)
+#elif defined(__HIP_PLATFORM_AMD__) && !defined(SEEKDB_CUVS_CPU_TEST)
 #error "The HIP bridge requires C++ SDK serialization; use the supplied build.sh"
 #else
-/* Preserve the non-HIP, CPU-only C fake used by the file/ownership tests. */
+/* The explicit CPU fake has no real SDK or shared memory resource. */
 #define SK_CUVS_SDK_GUARD() ((void)0)
 #endif
 

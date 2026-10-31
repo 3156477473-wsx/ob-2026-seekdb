@@ -65,10 +65,12 @@ int main() {
   // Both formats, nonzero offsets, odd entry counts and partial last batches.
   for (bool packed : {false, true}) {
     transport(4099, 192, 1024, packed);
+    transport(4099, 256, 1024, packed);
     transport(103, 7, 13, packed);
     transport(31, 3, 1, packed);
   }
   transport(250000, 192, 1024, true);
+  transport(250000, 256, 1024, true);
   seekdb_hipvs::KnnCopySlice slices[2];
   unsigned length = 9;
   require(!seekdb_hipvs::make_knn_copy_slices(10, 192, 0, 0, true, slices, length) && length == 0);

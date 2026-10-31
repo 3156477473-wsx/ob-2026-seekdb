@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define SEEKDB_CUVS_CPU_TEST 1
 /* Linux LP64 CPU fake: exercises the actual candidate C file, never HIP/ANN. */
 #include <assert.h>
 #include <limits.h>
@@ -487,17 +488,18 @@ int main(void)
     fault = (enum Fault)f; reset_order();
     assert(!seekdb_cuvs_build(base, 4, 128)); no_live_resources();
   }
-  float *gpu_base = (float *)calloc((size_t)256 * 128, sizeof(float)); assert(gpu_base);
-  expected = gpu_base; expected_n = 256; expected_dim = 128;
+  const long gpu_rows = SEEKDB_IVFPQ_MIN_ROWS;
+  float *gpu_base = (float *)calloc((size_t)gpu_rows * 128, sizeof(float)); assert(gpu_base);
+  expected = gpu_base; expected_n = gpu_rows; expected_dim = 128;
   for (int f = F_HOST_CALLOC; f <= F_BUILD; ++f) {
     fault = (enum Fault)f; reset_order();
-    assert(!seekdb_cuvs_build(gpu_base, 256, 128)); no_live_resources();
+    assert(!seekdb_cuvs_build(gpu_base, gpu_rows, 128)); no_live_resources();
   }
   const enum Fault graph_faults[] = {F_GRAPH_ALLOC, F_GRAPH_WORK, F_GRAPH_PUBLISHED};
   for (size_t j = 0; j < sizeof(graph_faults) / sizeof(graph_faults[0]); ++j) {
     fault = graph_faults[j]; reset_order();
     int before = gpu_graph_calls;
-    assert(!seekdb_cuvs_build(gpu_base, 256, 128));
+    assert(!seekdb_cuvs_build(gpu_base, gpu_rows, 128));
     assert(gpu_graph_calls == before + 1); no_live_resources();
   }
   free(gpu_base); expected = base; expected_n = 4; expected_dim = 128;
