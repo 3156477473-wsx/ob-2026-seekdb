@@ -12,7 +12,11 @@ typedef struct {
   unsigned int *graph;
   int borrowed_graph;
 } *cuvsCagraIndex_t;
-typedef struct { size_t itopk_size, search_width; } *cuvsCagraSearchParams_t;
+enum cuvsCagraSearchAlgo { SINGLE_CTA, MULTI_CTA, MULTI_KERNEL, AUTO };
+typedef struct {
+  size_t itopk_size, search_width;
+  enum cuvsCagraSearchAlgo algo;
+} *cuvsCagraSearchParams_t;
 typedef struct { int type; uintptr_t addr; } cuvsFilter;
 enum { NN_DESCENT = 2, NO_FILTER = 0, L2Expanded = 0 };
 #ifdef __cplusplus

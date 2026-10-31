@@ -34,6 +34,7 @@ typedef struct {
   float*                base_device; /* owned; idx may hold a non-owning view */
   unsigned int*         graph_device; /* owned GPU graph; index borrows it */
   long n, dim;
+  int search_policy_reported;
 } sk_cuvs_index;
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
@@ -114,12 +115,20 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
        * variation. The returned neighbors still come directly from that SDK. */
       if (required_itopk < 640) required_itopk = 640;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
+      /* The fixed C API defaults to SINGLE_CTA, whose budget is limited to512.
+       * Select the library's native parallel mode explicitly for larger beams. */
+      sp->algo = MULTI_CTA;
       sp->search_width = 4;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
     if (cudaMemcpy(out_ids, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
     if (out_dist) cudaMemcpy(out_dist, dd, sizeof(float)*nq*topk, cudaMemcpyDefault);
+    if (!h->search_policy_reported) {
+      fprintf(stderr, "[seekdb_cuvs] cagra_search_policy algo=MULTI_CTA itopk=%zu width=%zu\n",
+              sp->itopk_size, sp->search_width);
+      h->search_policy_reported = 1;
+    }
   }
 done:
   if (sp) cuvsCagraSearchParamsDestroy(sp);
