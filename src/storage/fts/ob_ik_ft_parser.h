@@ -46,7 +46,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        dict_borrowed_{false, false, false}
   {
   }
 
@@ -106,6 +107,9 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  // Dictionaries are immutable once built, so they come from the hub cache
+  // and must not be destroyed by the parser that borrows them.
+  bool dict_borrowed_[3];
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

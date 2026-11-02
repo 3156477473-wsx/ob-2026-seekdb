@@ -76,11 +76,92 @@ int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &
         if (OB_FAIL(ObFTRangeDict::build_cache_from_ik_dict(desc, container))) {
         } else if (FALSE_IT(info.range_count_ = container.get_handles().size())) {
         } else if (OB_FAIL(put_dict_info(key, info))) {
+        } else if (FALSE_IT(invalidate_built_dict(desc.type_))) {
         }
       }
     }
   }
   return ret;
+}
+
+class ObFTBuiltDictCache
+{
+public:
+  ObFTBuiltDictCache(ObIAllocator &alloc) : container_(alloc), dict_(nullptr), version_(0) {}
+public:
+  ObFTCacheRangeContainer container_;
+  ObIFTDict *dict_;
+  int64_t version_;
+};
+
+static int built_dict_slot(const ObFTDictType type)
+{
+  int slot = -1;
+  switch (type) {
+  case ObFTDictType::DICT_IK_MAIN: slot = 0; break;
+  case ObFTDictType::DICT_IK_QUAN: slot = 1; break;
+  case ObFTDictType::DICT_IK_STOP: slot = 2; break;
+  default: slot = -1; break;
+  }
+  return slot;
+}
+
+int ObFTDictHub::get_built_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  const int slot = built_dict_slot(desc.type_);
+
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (slot < 0) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    ObFTBuiltDictCache *cached = ATOMIC_LOAD(&built_dicts_[slot]);
+    if (OB_NOT_NULL(cached)) {
+      dict = cached->dict_;
+    } else {
+      // First use of this dictionary in the process: materialize the cache and
+      // build the range dictionary once. Every later tokenize() call reuses it.
+      ObFTBuiltDictCache *fresh = OB_NEWx(ObFTBuiltDictCache, &dict_cache_alloc_,
+                                          dict_cache_alloc_);
+      if (OB_ISNULL(fresh)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        ret = load_cache(desc, fresh->container_);
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          ret = build_cache(desc, fresh->container_);
+        }
+        if (OB_SUCC(ret) && OB_ISNULL(fresh->dict_ =
+                OB_NEWx(ObFTRangeDict, &dict_cache_alloc_, dict_cache_alloc_,
+                        &fresh->container_, desc))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        }
+        if (OB_SUCC(ret) && OB_FAIL(fresh->dict_->init())) {
+        }
+        if (OB_SUCC(ret)) {
+          ObFTBuiltDictCache *expected = nullptr;
+          if (!ATOMIC_CAS(&built_dicts_[slot], expected, fresh)) {
+            // Another session won the race; both instances are identical and
+            // read-only, so use the published one.
+          }
+          cached = ATOMIC_LOAD(&built_dicts_[slot]);
+          dict = OB_NOT_NULL(cached) ? cached->dict_ : fresh->dict_;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void ObFTDictHub::invalidate_built_dict(const ObFTDictType type)
+{
+  const int slot = built_dict_slot(type);
+  if (slot >= 0) {
+    // Drop the shared instance so the next parser rebuilds it from the fresh
+    // cache. The old instance is intentionally left to the hub allocator.
+    ATOMIC_STORE(&built_dicts_[slot], nullptr);
+  }
 }
 
 int ObFTDictHub::load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)

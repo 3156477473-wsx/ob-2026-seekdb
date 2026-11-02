@@ -92,11 +92,17 @@ private:
   // name
 };
 
+class ObIFTDict;
 class ObFTCacheRangeContainer;
+class ObFTBuiltDictCache;
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub()
+      : is_inited_(false), dict_map_(), rw_dict_lock_(), dict_cache_alloc_(),
+        built_dicts_{nullptr, nullptr, nullptr, nullptr}
+  {
+  }
   ~ObFTDictHub() {}
 
   int init();
@@ -107,8 +113,14 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Returns the shared, read-only dictionary for `desc`, building it on first
+  // use. The caller must not destroy the returned dictionary.
+  int get_built_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
+
+  void invalidate_built_dict(const ObFTDictType type);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
@@ -118,6 +130,9 @@ private:
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  common::ObArenaAllocator dict_cache_alloc_;
+  // Slot per IK dictionary type, filled once and read by every parser.
+  ObFTBuiltDictCache *built_dicts_[4];
 };
 
 } //  namespace storage
