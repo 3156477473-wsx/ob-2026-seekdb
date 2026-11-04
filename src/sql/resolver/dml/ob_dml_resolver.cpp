@@ -3839,7 +3839,14 @@ int fsql_build_columns(const filesql::Schema &schema, oceanbase::common::ObSqlSt
   for (int64_t i = 0; OB_SUCC(ret) && i < static_cast<int64_t>(schema.size()); ++i) {
     const filesql::Column &col = schema[i];
     std::string name;
+    std::string jname;
     fsql_escape_literal(col.name, name);
+    for (size_t k = 0; k < name.size(); ++k) {
+      if ('"' == name[k] || '\\' == name[k]) {
+        jname.push_back('\\');
+      }
+      jname.push_back(name[k]);
+    }
     if (i > 0 && OB_FAIL(out.append(", "))) {
     } else if (OB_FAIL(out.append("`"))) {
     } else if (OB_FAIL(out.append(name.c_str()))) {
@@ -3849,7 +3856,10 @@ int fsql_build_columns(const filesql::Schema &schema, oceanbase::common::ObSqlSt
       }
     } else if (OB_FAIL(out.append(fsql_column_type_text(col.type)))) {
     }
-    if (OB_SUCC(ret) && OB_FAIL(out.append_fmt(" PATH '$.%s'", name.c_str()))) {
+    if (OB_SUCC(ret) && OB_FAIL(out.append(" PATH '$."))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(out.append("\""))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(out.append(jname.c_str()))) {
+    } else if (OB_SUCC(ret) && OB_FAIL(out.append("\"' "))) {
     }
   }
   return ret;
@@ -3958,7 +3968,15 @@ int ObDMLResolver::resolve_file_sql_item(const ParseNode &parse_tree, TableItem 
   if (OB_SUCC(ret)) {
     const std::string file_path(path.ptr(), path.length());
     int rc = 0;
-    if (3 == file_type) {
+    ObString secure_file_priv;
+    ObString secure_path;
+    secure_path.assign_ptr(path.ptr(), path.length());
+    if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+      LOG_WARN("failed to get secure file priv", K(ret));
+    } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, secure_path))) {
+      LOG_WARN("file sql path is outside of secure_file_priv", K(ret),
+               K(secure_file_priv), K(secure_path));
+    } else if (3 == file_type) {
       rc = filesql::glob_files_as_json(file_path, json_text, error);
     } else {
       if (2 == file_type) {
