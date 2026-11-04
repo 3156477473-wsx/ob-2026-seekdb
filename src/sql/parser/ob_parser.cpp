@@ -1050,6 +1050,287 @@ int ObParser::parse_(const ObString &query,
   return ret;
 }
 
+
+namespace {
+
+// DuckDB style COPY ( <query> ) TO '<path>' ( format csv, header, nullstr 'NULL' )
+// is executed by rewriting it into the equivalent SELECT ... INTO OUTFILE
+// statement: the query body is kept as is, an optional header row is prepended
+// through a UNION ALL over string literals.
+inline bool fsql_is_space(char c)
+{
+  return ' ' == c || '\t' == c || '\n' == c || '\r' == c || '\f' == c;
+}
+
+inline bool fsql_lower_eq(const char *a, const char *b, int64_t n)
+{
+  bool same = true;
+  for (int64_t i = 0; same && i < n; ++i) {
+    char x = a[i];
+    char y = b[i];
+    if (x >= 'A' && x <= 'Z') { x = static_cast<char>(x - 'A' + 'a'); }
+    if (y >= 'A' && y <= 'Z') { y = static_cast<char>(y - 'A' + 'a'); }
+    same = (x == y);
+  }
+  return same;
+}
+
+inline int64_t fsql_skip_space(const std::string &text, int64_t pos)
+{
+  while (pos < static_cast<int64_t>(text.size()) && fsql_is_space(text[static_cast<size_t>(pos)])) {
+    ++pos;
+  }
+  return pos;
+}
+
+inline std::string fsql_trim(const std::string &text)
+{
+  int64_t begin = 0;
+  int64_t end = static_cast<int64_t>(text.size());
+  while (begin < end && fsql_is_space(text[static_cast<size_t>(begin)])) { ++begin; }
+  while (end > begin && fsql_is_space(text[static_cast<size_t>(end - 1)])) { --end; }
+  return text.substr(static_cast<size_t>(begin), static_cast<size_t>(end - begin));
+}
+
+// Index of the bracket that closes the one at `open`, -1 when unbalanced.
+int64_t fsql_match_bracket(const std::string &text, int64_t open)
+{
+  int64_t depth = 0;
+  int64_t result = -1;
+  bool done = false;
+  for (int64_t i = open; !done && i < static_cast<int64_t>(text.size()); ++i) {
+    const char c = text[static_cast<size_t>(i)];
+    if ('\'' == c || '"' == c || '`' == c) {
+      const char quote = c;
+      bool closed = false;
+      for (int64_t j = i + 1; !closed && j < static_cast<int64_t>(text.size()); ++j) {
+        if (quote == text[static_cast<size_t>(j)]) {
+          if (j + 1 < static_cast<int64_t>(text.size())
+              && quote == text[static_cast<size_t>(j + 1)]) {
+            ++j;
+          } else {
+            i = j;
+            closed = true;
+          }
+        }
+      }
+      if (!closed) { done = true; }
+    } else if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      --depth;
+      if (0 == depth) {
+        result = i;
+        done = true;
+      }
+    }
+  }
+  return result;
+}
+
+// Column names of the projection of `query`, used to build the header row.
+std::vector<std::string> fsql_projection_names(const std::string &query)
+{
+  std::vector<std::string> names;
+  int64_t depth = 0;
+  int64_t select_pos = -1;
+  int64_t from_pos = -1;
+  for (int64_t i = 0; i < static_cast<int64_t>(query.size()) && from_pos < 0; ++i) {
+    const char c = query[static_cast<size_t>(i)];
+    if ('\'' == c || '"' == c) {
+      const char quote = c;
+      for (int64_t j = i + 1; j < static_cast<int64_t>(query.size()); ++j) {
+        if (quote == query[static_cast<size_t>(j)]) {
+          if (j + 1 < static_cast<int64_t>(query.size())
+              && quote == query[static_cast<size_t>(j + 1)]) { ++j; } else { i = j; break; }
+        }
+      }
+    } else if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      --depth;
+    } else if (0 == depth && select_pos < 0 && i + 6 <= static_cast<int64_t>(query.size())
+               && fsql_lower_eq(query.c_str() + i, "select", 6)) {
+      select_pos = i + 6;
+      i += 5;
+    } else if (0 == depth && select_pos >= 0 && i + 4 <= static_cast<int64_t>(query.size())
+               && fsql_lower_eq(query.c_str() + i, "from", 4)) {
+      from_pos = i;
+      i += 3;
+    }
+  }
+  if (select_pos >= 0 && from_pos > select_pos) {
+    const std::string list = query.substr(static_cast<size_t>(select_pos),
+                                          static_cast<size_t>(from_pos - select_pos));
+    std::vector<std::string> items;
+    std::string current;
+    depth = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(list.size()); ++i) {
+      const char c = list[static_cast<size_t>(i)];
+      if ('\'' == c || '"' == c) {
+        const char quote = c;
+        current.push_back(c);
+        for (int64_t j = i + 1; j < static_cast<int64_t>(list.size()); ++j) {
+          current.push_back(list[static_cast<size_t>(j)]);
+          if (quote == list[static_cast<size_t>(j)]) {
+            if (j + 1 < static_cast<int64_t>(list.size())
+                && quote == list[static_cast<size_t>(j + 1)]) {
+              current.push_back(list[static_cast<size_t>(++j)]);
+            } else { i = j; break; }
+          }
+        }
+      } else if ('(' == c) { ++depth; current.push_back(c); }
+      else if (')' == c) { --depth; current.push_back(c); }
+      else if (',' == c && 0 == depth) { items.push_back(current); current.clear(); }
+      else { current.push_back(c); }
+    }
+    items.push_back(current);
+    for (size_t i = 0; i < items.size(); ++i) {
+      std::string item = fsql_trim(items[i]);
+      std::string alias;
+      const size_t as_pos = item.rfind(" as ");
+      const size_t upper_as_pos = item.rfind(" AS ");
+      size_t cut = std::string::npos;
+      if (std::string::npos != as_pos) { cut = as_pos; }
+      else if (std::string::npos != upper_as_pos) { cut = upper_as_pos; }
+      if (std::string::npos != cut) {
+        alias = fsql_trim(item.substr(cut + 4));
+      } else if (!item.empty() && ')' != item[item.size() - 1]) {
+        size_t begin = item.size();
+        while (begin > 0) {
+          const char c = item[begin - 1];
+          if (('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9')
+              || '_' == c || '$' == c) { --begin; } else { break; }
+        }
+        alias = item.substr(begin);
+      }
+      if (alias.size() >= 2 && '`' == alias[0] && '`' == alias[alias.size() - 1]) {
+        alias = alias.substr(1, alias.size() - 2);
+      }
+      if (alias.empty()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "column_%ld", static_cast<long>(i + 1));
+        alias = buf;
+      }
+      names.push_back(alias);
+    }
+  }
+  return names;
+}
+
+std::string fsql_quote_literal(const std::string &text)
+{
+  std::string out;
+  out.reserve(text.size() + 2);
+  for (size_t i = 0; i < text.size(); ++i) {
+    if ('\'' == text[i] || '\\' == text[i]) {
+      out.push_back('\\');
+    }
+    out.push_back(text[i]);
+  }
+  return out;
+}
+
+int fsql_rewrite_copy(const ObString &query,
+                      ObIAllocator &alloc,
+                      ObString &rewritten)
+{
+  int ret = 1;
+  if (query.empty()) {
+    // nothing to do
+  } else {
+    const std::string text(query.ptr(), static_cast<size_t>(query.length()));
+    int64_t pos = fsql_skip_space(text, 0);
+    if (pos + 4 <= static_cast<int64_t>(text.size())
+        && fsql_lower_eq(text.c_str() + pos, "copy", 4)) {
+      pos += 4;
+      const int64_t after_keyword = fsql_skip_space(text, pos);
+      if (after_keyword < static_cast<int64_t>(text.size()) && '(' == text[static_cast<size_t>(after_keyword)]) {
+        const int64_t close = fsql_match_bracket(text, after_keyword);
+        if (close > 0) {
+          std::string body = text.substr(static_cast<size_t>(after_keyword + 1),
+                                         static_cast<size_t>(close - after_keyword - 1));
+          int64_t cursor = fsql_skip_space(text, close + 1);
+          if (cursor + 2 <= static_cast<int64_t>(text.size())
+              && fsql_lower_eq(text.c_str() + cursor, "to", 2)) {
+            cursor = fsql_skip_space(text, cursor + 2);
+            if (cursor < static_cast<int64_t>(text.size())
+                && ('\'' == text[static_cast<size_t>(cursor)]
+                    || '"' == text[static_cast<size_t>(cursor)])) {
+              const char quote = text[static_cast<size_t>(cursor)];
+              std::string path;
+              bool closed = false;
+              int64_t j = cursor + 1;
+              for (; !closed && j < static_cast<int64_t>(text.size()); ++j) {
+                if (quote == text[static_cast<size_t>(j)]) {
+                  if (j + 1 < static_cast<int64_t>(text.size())
+                      && quote == text[static_cast<size_t>(j + 1)]) {
+                    path.push_back(quote);
+                    ++j;
+                  } else {
+                    closed = true;
+                  }
+                } else {
+                  path.push_back(text[static_cast<size_t>(j)]);
+                }
+              }
+              if (closed) {
+                bool with_header = false;
+                for (size_t k = static_cast<size_t>(j); k + 6 <= text.size(); ++k) {
+                  if (fsql_lower_eq(text.c_str() + k, "header", 6)) {
+                    size_t value = k + 6;
+                    while (value < text.size() && fsql_is_space(text[value])) { ++value; }
+                    if (value < text.size() && '=' == text[value]) {
+                      ++value;
+                      value = static_cast<size_t>(fsql_skip_space(text, static_cast<int64_t>(value)));
+                      with_header = (value + 4 <= text.size()
+                                     && fsql_lower_eq(text.c_str() + value, "true", 4))
+                                    || (value < text.size() && ('1' == text[value]));
+                    } else {
+                      // a bare "header" flag means true
+                      with_header = true;
+                    }
+                    break;
+                  }
+                }
+                std::string sql;
+                if (with_header) {
+                  const std::vector<std::string> names = fsql_projection_names(body);
+                  sql += "SELECT ";
+                  for (size_t i = 0; i < names.size(); ++i) {
+                    if (i > 0) { sql += ", "; }
+                    sql += "'";
+                    sql += fsql_quote_literal(names[i]);
+                    sql += "'";
+                  }
+                  sql += " UNION ALL (";
+                  sql += body;
+                  sql += ")";
+                } else {
+                  sql += body;
+                }
+                sql += " INTO OUTFILE '";
+                sql += fsql_quote_literal(path);
+                sql += "' FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"'";
+                sql += " LINES TERMINATED BY '\\n'";
+                char *buf = static_cast<char *>(alloc.alloc(sql.size()));
+                if (NULL != buf) {
+                  MEMCPY(buf, sql.c_str(), sql.size());
+                  rewritten.assign_ptr(buf, static_cast<int32_t>(sql.size()));
+                  ret = 0;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
 int ObParser::parse(const ObString &query,
                     ParseResult &parse_result,
                     ParseMode parse_mode,
@@ -1058,7 +1339,11 @@ int ObParser::parse(const ObString &query,
                     const bool is_pl_inner_parse,
                     const bool is_parse_dynamic_sql)
 {
-  return SMART_CALL(parse_(query,
+  ObString rewritten;
+  const ObString &real_query =
+      (NULL != allocator_ && 0 == fsql_rewrite_copy(query, *allocator_, rewritten))
+          ? rewritten : query;
+  return SMART_CALL(parse_(real_query,
                           parse_result,
                           parse_mode,
                           is_batched_multi_stmt_split_on,

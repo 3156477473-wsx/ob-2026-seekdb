@@ -17493,15 +17493,15 @@ file_sql_call
 ;
 
 file_sql_args:
-literal
+signed_literal
 {
   $$ = $1;
 }
-| file_sql_args ',' literal
+| file_sql_args ',' signed_literal
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
-| file_sql_args ',' column_name COMP_EQ literal
+| file_sql_args ',' column_name COMP_EQ signed_literal
 {
   ParseNode *eq_node = NULL;
   malloc_non_terminal_node(eq_node, result->malloc_pool_, T_OP_EQ, 2, $3, $5);
