@@ -55,6 +55,123 @@ ObCreateTableResolver::~ObCreateTableResolver()
 {
 }
 
+
+// AI column support: derive the three hidden companion columns of an AI column.
+// The metadata the worker needs is carried in the hidden columns themselves:
+//   __ai_state_<col>  comment "ai:max_retries=<n>"
+//   __ai_req_<col>    comment "ai:expr=<normalized expression>"
+//   __ai_spec_<col>   comment "ai:spec=<json|text>"
+int ObCreateTableResolver::append_ai_column_hidden_columns(
+    ParseNode *element,
+    const ObString &column_name,
+    const bool is_json_col,
+    ObIArray<ObColumnSchemaV2> &cols)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *attrs = NULL;
+  ParseNode *ai_node = NULL;
+  if (OB_ISNULL(element) || OB_ISNULL(allocator_) || element->num_child_ < 3) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(attrs = element->children_[2])) {
+    // no column attributes at all
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < attrs->num_child_; ++i) {
+      if (OB_NOT_NULL(attrs->children_[i])
+          && T_CONSTR_AI_COLUMN == attrs->children_[i]->type_) {
+        ai_node = attrs->children_[i];
+      }
+    }
+  }
+  if (OB_SUCC(ret) && NULL != ai_node) {
+    ParseNode *expr_node = ai_node->num_child_ > 0 ? ai_node->children_[0] : NULL;
+    ParseNode *option_list = ai_node->num_child_ > 1 ? ai_node->children_[1] : NULL;
+    int64_t max_retries = 0;
+    ObString expr_text;
+    if (OB_ISNULL(expr_node)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      expr_text.assign_ptr(expr_node->str_value_, static_cast<int32_t>(expr_node->str_len_));
+      // options arrive as a chain of T_OP_EQ(name, value) nodes
+      ObSEArray<ParseNode *, 4> options;
+      ParseNode *cur = option_list;
+      while (OB_SUCC(ret) && NULL != cur) {
+        if (T_LINK_NODE == cur->type_ && 2 == cur->num_child_) {
+          if (OB_FAIL(options.push_back(cur->children_[1]))) {
+          } else {
+            cur = cur->children_[0];
+          }
+        } else {
+          if (OB_FAIL(options.push_back(cur))) {
+          }
+          cur = NULL;
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < options.count(); ++i) {
+        ParseNode *opt = options.at(i);
+        if (OB_ISNULL(opt) || T_OP_EQ != opt->type_ || 2 != opt->num_child_
+            || OB_ISNULL(opt->children_[0]) || OB_ISNULL(opt->children_[1])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObString name(static_cast<int32_t>(opt->children_[0]->str_len_),
+                        opt->children_[0]->str_value_);
+          ParseNode *value = opt->children_[1];
+          if (0 == name.case_compare("max_retries")) {
+            max_retries = value->value_;
+          }
+        }
+      }
+    }
+    char suffix_buf[64];
+    if (OB_SUCC(ret)) {
+      ObSqlString state_cmt;
+      ObSqlString req_cmt;
+      ObSqlString spec_cmt;
+      ObString spec_text;
+      if (OB_FAIL(state_cmt.append_fmt("ai:max_retries=%ld", max_retries))) {
+      } else if (OB_FAIL(spec_cmt.append_fmt("ai:spec=%s", is_json_col ? "json" : "text"))) {
+      } else if (OB_FAIL(req_cmt.append("ai:expr="))) {
+      } else if (OB_FAIL(req_cmt.append(expr_text))) {
+      } else if (is_json_col && OB_FAIL(req_cmt.append(" %Return exactly one valid JSON value%"))) {
+      } else {
+        const char *prefixes[3] = {"__ai_state_", "__ai_req_", "__ai_spec_"};
+        ObString comments[3];
+        comments[0] = ObString(state_cmt.length(), state_cmt.ptr());
+        comments[1] = ObString(req_cmt.length(), req_cmt.ptr());
+        comments[2] = ObString(spec_cmt.length(), spec_cmt.ptr());
+        for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+          ObColumnSchemaV2 hidden;
+          ObSqlString name_builder;
+          ObString stored_name;
+          ObString stored_comment;
+          if (OB_FAIL(name_builder.append(prefixes[i]))) {
+          } else if (OB_FAIL(name_builder.append(column_name))) {
+          } else if (OB_FAIL(ob_write_string(*allocator_, ObString(name_builder.length(), name_builder.ptr()), stored_name))) {
+          } else if (OB_FAIL(ob_write_string(*allocator_, comments[i], stored_comment))) {
+          } else {
+            hidden.set_column_id(gen_column_id());
+            hidden.set_column_name(stored_name);
+            hidden.set_nullable(true);
+            hidden.set_is_hidden(true);
+            hidden.set_comment(stored_comment);
+            if (0 == i) {
+              hidden.set_data_type(ObDateTimeType);
+            } else {
+              hidden.set_data_type(ObLongTextType);
+              hidden.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+              hidden.set_charset_type(CHARSET_UTF8MB4);
+            }
+            if (OB_FAIL(cols.push_back(hidden))) {
+              SQL_RESV_LOG(WARN, "push ai hidden column failed", K(ret), K(hidden));
+            }
+          }
+        }
+      }
+      UNUSED(suffix_buf);
+    }
+  }
+  return ret;
+}
+
 uint64_t ObCreateTableResolver::gen_column_id()
 {
   return ++cur_column_id_;
@@ -663,8 +780,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         }
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(resolve_column_name(column, element))) {
-        } else {
-          OZ (resolved_cols.push_back(column));
+        } else if (OB_FAIL(resolved_cols.push_back(column))) {
         }
       }
     }
@@ -881,6 +997,31 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    // AI columns keep three hidden helper columns each; append them after the
+    // regular columns have been resolved so the column cursor stays aligned.
+    if (OB_SUCC(ret) && RESOLVE_ALL == resolve_rule) {
+      int64_t col_index = 0;
+      for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+        ParseNode *ai_element = node->children_[i];
+        if (OB_ISNULL(ai_element)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (T_COLUMN_DEFINITION != ai_element->type_) {
+          // not a column definition
+        } else if (col_index >= resolved_cols_count) {
+          break;
+        } else {
+          const ObColumnSchemaV2 &ai_col = resolved_cols.at(col_index);
+          const ObString ai_col_name = ai_col.get_column_name();
+          const bool ai_col_is_json = ob_is_json_tc(ai_col.get_data_type());
+          ++col_index;
+          if (OB_FAIL(append_ai_column_hidden_columns(ai_element, ai_col_name,
+                                                      ai_col_is_json, resolved_cols))) {
+            SQL_RESV_LOG(WARN, "failed to append ai column hidden columns", K(ret));
+          }
+        }
       }
     }
 

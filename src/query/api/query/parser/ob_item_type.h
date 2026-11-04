@@ -2047,6 +2047,7 @@ typedef enum ObItemType
   T_PARTITION_RANGE_ELEMENT = 4557,
 
   T_CONSTR_LOB_CHUNK_SIZE = 4558,
+  T_CONSTR_AI_COLUMN = 4600,
   T_LOB_CHUNK_SIZE = 4559,
 
   T_ALTER_SYSTEM_KILL = 4560, // used to support kill session

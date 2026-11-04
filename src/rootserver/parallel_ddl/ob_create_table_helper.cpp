@@ -26,6 +26,7 @@
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "share/ob_dml_sql_splicer.h"
 
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
@@ -858,11 +859,86 @@ int ObCreateTableHelper::get_mock_fk_parent_table_info_(
 
 
 
+static int insert_ai_column_metadata(const ObTableSchema &table_schema,
+                                     ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  ObDMLSqlSplicer sql;
+  ObSqlString buffer;
+  int64_t affected_rows = 0;
+  const char *req_prefix = "__ai_req_";
+  const int64_t req_prefix_len = 9;
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *req_col = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(req_col)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const ObString &col_name = req_col->get_column_name_str();
+      if (col_name.length() > req_prefix_len
+          && 0 == col_name.compare(ObString(static_cast<int32_t>(req_prefix_len), req_prefix))) {
+        ObString base_name(col_name.length() - static_cast<int32_t>(req_prefix_len),
+                           col_name.ptr() + req_prefix_len);
+        char state_name[OB_MAX_COLUMN_NAME_LENGTH];
+        char spec_name[OB_MAX_COLUMN_NAME_LENGTH];
+        int64_t state_len = snprintf(state_name, sizeof(state_name), "__ai_state_%.*s",
+                                     base_name.length(), base_name.ptr());
+        int64_t spec_len = snprintf(spec_name, sizeof(spec_name), "__ai_spec_%.*s",
+                                    base_name.length(), base_name.ptr());
+        const ObColumnSchemaV2 *state_col = NULL;
+        const ObColumnSchemaV2 *spec_col = NULL;
+        const ObColumnSchemaV2 *vis_col = NULL;
+        int64_t max_retries = 0;
+        ObString norm_expr;
+        if (state_len <= 0 || state_len >= static_cast<int64_t>(sizeof(state_name))
+            || spec_len <= 0 || spec_len >= static_cast<int64_t>(sizeof(spec_name))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_ISNULL(state_col = table_schema.get_column_schema(state_name))
+                   || OB_ISNULL(spec_col = table_schema.get_column_schema(spec_name))
+                   || OB_ISNULL(vis_col = table_schema.get_column_schema(base_name))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const ObString &state_cmt = state_col->get_comment_str();
+          const ObString &req_cmt = req_col->get_comment_str();
+          const char *retry_tag = "ai:max_retries=";
+          const int64_t retry_tag_len = static_cast<int64_t>(strlen(retry_tag));
+          const char *expr_tag = "ai:expr=";
+          const int64_t expr_tag_len = static_cast<int64_t>(strlen(expr_tag));
+          if (state_cmt.length() > retry_tag_len
+              && 0 == state_cmt.compare(ObString(static_cast<int32_t>(retry_tag_len), retry_tag))) {
+            max_retries = atoll(state_cmt.ptr() + retry_tag_len);
+          }
+          if (req_cmt.length() > expr_tag_len
+              && 0 == req_cmt.compare(ObString(static_cast<int32_t>(expr_tag_len), expr_tag))) {
+            norm_expr.assign_ptr(req_cmt.ptr() + expr_tag_len,
+                                 req_cmt.length() - static_cast<int32_t>(expr_tag_len));
+          }
+          sql.reset();
+          if (OB_FAIL(sql.add_pk_column("table_id", table_schema.get_table_id()))) {
+          } else if (OB_FAIL(sql.add_pk_column("column_id", vis_col->get_column_id()))) {
+          } else if (OB_FAIL(sql.add_column("column_name", base_name))) {
+          } else if (OB_FAIL(sql.add_column("max_retries", max_retries))) {
+          } else if (OB_FAIL(sql.add_column("normalized_expr", norm_expr))) {
+          } else if (OB_FAIL(sql.add_column("state_column_id", state_col->get_column_id()))) {
+          } else if (OB_FAIL(sql.add_column("request_column_id", req_col->get_column_id()))) {
+          } else if (OB_FAIL(sql.add_column("result_spec_column_id", spec_col->get_column_id()))) {
+          } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+          } else if (OB_FAIL(sql_client.write(buffer.ptr(), affected_rows))) {
+          } else if (affected_rows <= 0) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObCreateTableHelper::operate_schemas_() {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_FAIL(inner_create_table_(&arg_.ddl_stmt_str_,
                                          replace_mock_fk_parent_table_id_))) {
+  } else if (OB_FAIL(insert_ai_column_metadata(arg_.schema_, *sql_proxy_))) {
   }
   return ret;
 }

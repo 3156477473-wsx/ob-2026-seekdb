@@ -2283,6 +2283,7 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       }
       case T_VISIBLE:
       case T_INVISIBLE:
+      case T_CONSTR_AI_COLUMN:
       {
         break;
       }
