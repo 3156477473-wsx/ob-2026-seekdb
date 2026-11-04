@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "sql/resolver/dml/ob_file_sql_reader.h"
+#include "sql/parser/ob_sql_parser.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -137,6 +139,66 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   return ret;
 }
 
+
+// DuckDB style DESCRIBE SELECT: return the inferred column metadata of a file
+// table function instead of an execution plan.
+static int build_file_sql_describe(share::schema::ObSchemaGetterGuard &,
+                                   ObResolverParams &params,
+                                   const ParseNode &explain_node,
+                                   ParseResult &result,
+                                   bool &rewritten)
+{
+  int ret = OB_SUCCESS;
+  rewritten = false;
+  const ParseNode *file_node = NULL;
+  if (T_EXPLAIN != explain_node.type_) {
+    // nothing to do
+  } else {
+    // T_EXPLAIN children: type, display_type, into_table, statement_id, stmt
+    for (int64_t i = 0; NULL == file_node && i < explain_node.num_child_; ++i) {
+      if (OB_NOT_NULL(explain_node.children_[i])) {
+        file_node = sql::filesql::find_file_sql_node(*explain_node.children_[i]);
+      }
+    }
+  }
+  if (OB_ISNULL(file_node)) {
+    // plain explain, leave it alone
+  } else {
+    sql::filesql::Schema schema;
+    std::string error;
+    if (0 != sql::filesql::file_sql_schema_from_node(*file_node, schema, error)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("failed to inspect file for describe select", "error", error.c_str());
+      sql::filesql::Schema debug_schema;
+      std::string debug_error;
+      int debug_ret = sql::filesql::file_sql_schema_from_node(*file_node, debug_schema, debug_error);
+      LOG_WARN("describe file sql debug", K(debug_ret), "error", debug_error.c_str());
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.c_str());
+    } else {
+      ObSqlString sql;
+      for (int64_t i = 0; OB_SUCC(ret) && i < static_cast<int64_t>(schema.size()); ++i) {
+        if (OB_FAIL(sql.append_fmt("%sSELECT '%s' AS column_name, '%s' AS column_type, '%s' AS `null`, "
+                                   "NULL AS `key`, NULL AS `default`, NULL AS `extra`",
+                                   i > 0 ? " UNION ALL " : "",
+                                   schema[i].name.c_str(),
+                                   sql::filesql::type_name(schema[i].type),
+                                   schema[i].nullable ? "YES" : "NO"))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObParser parser(*params.allocator_, params.session_info_->get_sql_mode(),
+                        params.session_info_->get_charsets4parser());
+        if (OB_FAIL(parser.parse(sql.string(), result))) {
+          LOG_WARN("failed to parse file sql describe statement", K(ret));
+        } else {
+          rewritten = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
 #define REGISTER_STMT_RESOLVER(name)                                   \
@@ -144,9 +206,9 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
     ret = stmt_resolver_func<Ob##name##Resolver>(params_, *real_parse_tree, stmt); \
   } while (0)
 
-#define REGISTER_SELECT_STMT_RESOLVER(name)                                   \
-  do {                                                                        \
-    ret = select_stmt_resolver_func<Ob##name##Resolver>(params_, parse_tree, stmt); \
+#define REGISTER_SELECT_STMT_RESOLVER(name)                                       \
+  do {                                                                            \
+    ret = select_stmt_resolver_func<Ob##name##Resolver>(params_, *real_parse_tree, stmt); \
   } while (0)
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_resolve);
   int ret = OB_SUCCESS;
@@ -163,10 +225,25 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
     real_parse_tree = &parse_tree;
   }
 
+  if (OB_SUCC(ret) && T_EXPLAIN == parse_tree.type_) {
+    ParseResult describe_result;
+    bool describe_rewritten = false;
+    share::schema::ObSchemaGetterGuard *ignored_guard = NULL;
+    if (OB_FAIL(build_file_sql_describe(*ignored_guard, params_, parse_tree,
+                                        describe_result, describe_rewritten))) {
+    } else if (describe_rewritten) {
+      // ObParser returns a T_STMT_LIST wrapper; the statement itself is child 0.
+      if (OB_NOT_NULL(describe_result.result_tree_)
+          && describe_result.result_tree_->num_child_ > 0) {
+        real_parse_tree = describe_result.result_tree_->children_[0];
+      }
+    }
+  }
+
   if (OB_SUCC(ret)) {
-    params_.resolver_scope_stmt_type_ = parse_tree.type_;
+    params_.resolver_scope_stmt_type_ = real_parse_tree->type_;
     params_.session_info_->set_stmt_type(
-      ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_));
+      ObResolverUtils::get_stmt_type_by_item_type(real_parse_tree->type_));
     ObExecContext *exec_ctx = params_.session_info_->get_cur_exec_ctx();
     if (exec_ctx != nullptr && exec_ctx->get_sql_ctx() != nullptr) {
       //save the current stmt type on my context,

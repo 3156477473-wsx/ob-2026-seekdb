@@ -23,6 +23,8 @@
 %code requires {
 #include "parse_node.h"
 }
+%expect 5
+
 %{
 #include <stdint.h>
 #define YYDEBUG 1
@@ -292,7 +294,7 @@ END_P SET_VAR DELIMITER
         GENERAL GEOMETRY GEOMCOLLECTION GEOMETRYCOLLECTION GET_FORMAT GLOBAL GRANTS GROUP_CONCAT GROUPING
         GLOBAL_ALIAS
 
-        HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH
+        HASH HEAP HELP HISTOGRAM HOUR HIDDEN HYBRID HYBRID_HIST HYBRID_SEARCH READ_CSV READ_JSON READ_NDJSON READ_PARQUET FILE_SQL_GLOB
 
         IDENTIFIED IK_MODE ILOG IMMEDIATE IMPORT INCLUDING INCR INDEXES INFO
         INNODB INPLACE INSERT_METHOD INSTANT INSTANCE INVOKER IO IO_THREAD IPC ISOLATE ISOLATION ISSUER
@@ -498,6 +500,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_sql_expr file_sql_call file_sql_args
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10848,6 +10851,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_sql_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -17468,6 +17475,81 @@ HYBRID_SEARCH '(' literal ',' hybrid_search_param ')'
 }
 ;
 
+file_sql_expr:
+file_sql_call
+{
+  ParseNode *alias_node = NULL;
+  make_name_node(alias_node, result->malloc_pool_, "");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_EXPRESSION, 3, $1->children_[0], $1->children_[1], alias_node);
+}
+| file_sql_call relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_EXPRESSION, 3, $1->children_[0], $1->children_[1], $2);
+}
+| file_sql_call AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_EXPRESSION, 3, $1->children_[0], $1->children_[1], $3);
+}
+;
+
+file_sql_args:
+literal
+{
+  $$ = $1;
+}
+| file_sql_args ',' literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+| file_sql_args ',' column_name COMP_EQ literal
+{
+  ParseNode *eq_node = NULL;
+  malloc_non_terminal_node(eq_node, result->malloc_pool_, T_OP_EQ, 2, $3, $5);
+  if (OB_ISNULL(eq_node)) {
+  } else {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, eq_node);
+  }
+}
+;
+
+file_sql_call:
+READ_CSV '(' file_sql_args ')'
+{
+  ParseNode *type_node = NULL;
+  malloc_terminal_node(type_node, result->malloc_pool_, T_INT);
+  type_node->value_ = 0;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, type_node, $3);
+}
+| READ_JSON '(' file_sql_args ')'
+{
+  ParseNode *type_node = NULL;
+  malloc_terminal_node(type_node, result->malloc_pool_, T_INT);
+  type_node->value_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, type_node, $3);
+}
+| READ_NDJSON '(' file_sql_args ')'
+{
+  ParseNode *type_node = NULL;
+  malloc_terminal_node(type_node, result->malloc_pool_, T_INT);
+  type_node->value_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, type_node, $3);
+}
+| READ_PARQUET '(' file_sql_args ')'
+{
+  ParseNode *type_node = NULL;
+  malloc_terminal_node(type_node, result->malloc_pool_, T_INT);
+  type_node->value_ = 2;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, type_node, $3);
+}
+| FILE_SQL_GLOB '(' file_sql_args ')'
+{
+  ParseNode *type_node = NULL;
+  malloc_terminal_node(type_node, result->malloc_pool_, T_INT);
+  type_node->value_ = 3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, type_node, $3);
+}
+;
+
 hybrid_search_param:
 literal
 {
@@ -18181,6 +18263,11 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
+|       FILE_SQL_GLOB
 ;
 
 unreserved_keyword_special:
