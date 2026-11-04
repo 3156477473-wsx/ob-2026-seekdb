@@ -1,5 +1,12 @@
 <div align="center">
 
+> **2026 OceanBase 数据库大赛 · AMD 赛题提交**
+>
+> 使用 hipVS 在 AMD Radeon GPU 上加速 seekdb 的 HNSW 索引构建与批量检索。
+> 交付物（报告、数据、截图、可复现 SQL）全部位于 **[`amd/`](amd/README.md)**。
+>
+> 结果摘要：批量检索 N=4000 时 GPU 相比 CPU 加速 **11.98×**，recall@10 从 0.640 提升至 0.868。
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://mdn.alipayobjects.com/huamei_ytl0i7/afts/img/A*pKqtRILxGioAAAAAQLAAAAgAejCYAQ/original" width="420">
   <source media="(prefers-color-scheme: light)" srcset="https://mdn.alipayobjects.com/huamei_ytl0i7/afts/img/A*6BO4Q6D78GQAAAAAQFAAAAgAejCYAQ/original" width="420">
