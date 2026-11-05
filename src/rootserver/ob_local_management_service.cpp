@@ -646,6 +646,7 @@ int ObLocalManagementService::parallel_create_table(const ObCreateTableArg &arg,
 {
   int64_t begin_time = ObTimeUtility::current_time();
   int ret = OB_SUCCESS;
+  LOG_INFO("AICOLX enter parallel_create_table", "cols", arg.schema_.get_column_count());
   bool is_parallel = arg.is_parallel_;
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;

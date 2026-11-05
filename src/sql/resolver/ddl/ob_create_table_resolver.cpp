@@ -61,6 +61,110 @@ ObCreateTableResolver::~ObCreateTableResolver()
 //   __ai_state_<col>  comment "ai:max_retries=<n>"
 //   __ai_req_<col>    comment "ai:expr=<normalized expression>"
 //   __ai_spec_<col>   comment "ai:spec=<json|text>"
+namespace {
+
+bool ai_column_attr(ParseNode *element, ParseNode *&ai_node)
+{
+  bool found = false;
+  ai_node = NULL;
+  if (NULL != element && element->num_child_ >= 3 && NULL != element->children_[2]) {
+    ParseNode *attrs = element->children_[2];
+    for (int64_t i = 0; i < attrs->num_child_; ++i) {
+      if (NULL != attrs->children_[i] && T_CONSTR_AI_COLUMN == attrs->children_[i]->type_) {
+        ai_node = attrs->children_[i];
+        found = true;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+// returns the integer declared inside vector(N), or -1 when not a vector column
+int64_t ai_declared_vector_dim(ParseNode *element)
+{
+  int64_t dim = -1;
+  if (NULL != element && element->num_child_ >= 2 && NULL != element->children_[1]) {
+    ParseNode *dt = element->children_[1];
+    // vector(N) is parsed as T_COLLECTION with a single INTNUM child
+    if (T_COLLECTION == dt->type_ && dt->int32_values_[0] == 1
+        && dt->num_child_ >= 1 && NULL != dt->children_[0]) {
+      dim = dt->children_[0]->value_;
+    }
+  }
+  return dim;
+}
+
+bool ai_expr_has_ident(const ObString &expr, const ObString &ident)
+{
+  bool found = false;
+  const int32_t n = expr.length();
+  const char *p = expr.ptr();
+  for (int32_t i = 0; !found && i + ident.length() <= n; ++i) {
+    if (0 == strncasecmp(p + i, ident.ptr(), static_cast<size_t>(ident.length()))) {
+      const bool left_ok = (0 == i) || (!isalnum(static_cast<unsigned char>(p[i - 1])) && '_' != p[i - 1]);
+      const int32_t end = i + ident.length();
+      const bool right_ok = (end >= n) || (!isalnum(static_cast<unsigned char>(p[end])) && '_' != p[end]);
+      found = left_ok && right_ok;
+    }
+  }
+  return found;
+}
+
+// third argument of AI_EMBED(...) when it is a plain integer, otherwise -1
+int64_t ai_embed_declared_dim(const ObString &expr)
+{
+  int64_t dim = -1;
+  const char *p = expr.ptr();
+  const int32_t n = expr.length();
+  int32_t pos = -1;
+  for (int32_t i = 0; i + 8 <= n; ++i) {
+    if (0 == strncasecmp(p + i, "AI_EMBED", 8)) {
+      pos = i + 8;
+      break;
+    }
+  }
+  if (pos < 0) {
+    return dim;
+  }
+  while (pos < n && (' ' == p[pos] || '\t' == p[pos] || '\n' == p[pos])) { ++pos; }
+  if (pos >= n || '(' != p[pos]) {
+    return dim;
+  }
+  ++pos;
+  int32_t depth = 1;
+  int32_t commas = 0;
+  int32_t arg_start = pos;
+  for (int32_t i = pos; i < n && depth > 0; ++i) {
+    const char c = p[i];
+    if ('(' == c) {
+      ++depth;
+    } else if (')' == c) {
+      --depth;
+      if (0 == depth && 2 == commas) {
+        // third argument spans [arg_start, i)
+        bool digits = true;
+        int32_t begin = arg_start;
+        while (begin < i && (' ' == p[begin] || '\t' == p[begin])) { ++begin; }
+        int32_t end = i;
+        while (end > begin && (' ' == p[end - 1] || '\t' == p[end - 1])) { --end; }
+        for (int32_t k = begin; k < end; ++k) {
+          if (p[k] < '0' || p[k] > '9') { digits = false; }
+        }
+        if (digits && end > begin) {
+          dim = atoll(p + begin);
+        }
+      }
+    } else if (',' == c && 1 == depth) {
+      ++commas;
+      arg_start = i + 1;
+    }
+  }
+  return dim;
+}
+
+}  // namespace
+
 int ObCreateTableResolver::append_ai_column_hidden_columns(
     ParseNode *element,
     const ObString &column_name,
@@ -1003,6 +1107,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     // AI columns keep three hidden helper columns each; append them after the
     // regular columns have been resolved so the column cursor stays aligned.
     if (OB_SUCC(ret) && RESOLVE_ALL == resolve_rule) {
+      ObSEArray<ObString, 8> ai_names;
       int64_t col_index = 0;
       for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
         ParseNode *ai_element = node->children_[i];
@@ -1015,10 +1120,53 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         } else {
           const ObColumnSchemaV2 &ai_col = resolved_cols.at(col_index);
           const ObString ai_col_name = ai_col.get_column_name();
-          const bool ai_col_is_json = ob_is_json_tc(ai_col.get_data_type());
+          ParseNode *unused_ai_node = NULL;
+          if (ai_column_attr(ai_element, unused_ai_node)) {
+            if (OB_FAIL(ai_names.push_back(ai_col_name))) {
+            }
+          }
           ++col_index;
-          if (OB_FAIL(append_ai_column_hidden_columns(ai_element, ai_col_name,
-                                                      ai_col_is_json, resolved_cols))) {
+        }
+      }
+      col_index = 0;
+      for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+        ParseNode *ai_element = node->children_[i];
+        ParseNode *ai_node = NULL;
+        if (OB_ISNULL(ai_element)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (T_COLUMN_DEFINITION != ai_element->type_) {
+          // not a column definition
+        } else if (col_index >= resolved_cols_count) {
+          break;
+        } else if (!ai_column_attr(ai_element, ai_node)) {
+          ++col_index;
+        } else {
+          const ObColumnSchemaV2 &ai_col = resolved_cols.at(col_index);
+          const ObString ai_col_name = ai_col.get_column_name();
+          const bool ai_col_is_json = ob_is_json_tc(ai_col.get_data_type());
+          ObString expr_text;
+          if (NULL != ai_node->children_[0]) {
+            expr_text.assign_ptr(ai_node->children_[0]->str_value_,
+                                 static_cast<int32_t>(ai_node->children_[0]->str_len_));
+          }
+          const int64_t declared_dim = ai_declared_vector_dim(ai_element);
+          const int64_t embed_dim = ai_embed_declared_dim(expr_text);
+          for (int64_t k = 0; OB_SUCC(ret) && k < ai_names.count(); ++k) {
+            if (k == col_index) {
+              continue;
+            } else if (ai_expr_has_ident(expr_text, ai_names.at(k))) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "ai column depending on another ai column");
+            }
+          }
+          if (OB_SUCC(ret) && declared_dim >= 0 && embed_dim >= 0 && declared_dim != embed_dim) {
+            ret = OB_ERR_INVALID_VECTOR_DIM;
+            LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM, declared_dim, embed_dim);
+          }
+          ++col_index;
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(append_ai_column_hidden_columns(ai_element, ai_col_name,
+                                                             ai_col_is_json, resolved_cols))) {
             SQL_RESV_LOG(WARN, "failed to append ai column hidden columns", K(ret));
           }
         }

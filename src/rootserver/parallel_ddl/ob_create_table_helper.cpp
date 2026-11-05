@@ -868,6 +868,7 @@ static int insert_ai_column_metadata(const ObTableSchema &table_schema,
   int64_t affected_rows = 0;
   const char *req_prefix = "__ai_req_";
   const int64_t req_prefix_len = 9;
+  LOG_INFO("AICOL insert_ai_column_metadata", "cols", table_schema.get_column_count());
   for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
     const ObColumnSchemaV2 *req_col = table_schema.get_column_schema_by_idx(i);
     if (OB_ISNULL(req_col)) {
@@ -875,7 +876,7 @@ static int insert_ai_column_metadata(const ObTableSchema &table_schema,
     } else {
       const ObString &col_name = req_col->get_column_name_str();
       if (col_name.length() > req_prefix_len
-          && 0 == col_name.compare(ObString(static_cast<int32_t>(req_prefix_len), req_prefix))) {
+          && 0 == memcmp(col_name.ptr(), req_prefix, static_cast<size_t>(req_prefix_len))) {
         ObString base_name(col_name.length() - static_cast<int32_t>(req_prefix_len),
                            col_name.ptr() + req_prefix_len);
         char state_name[OB_MAX_COLUMN_NAME_LENGTH];
@@ -904,20 +905,20 @@ static int insert_ai_column_metadata(const ObTableSchema &table_schema,
           const char *expr_tag = "ai:expr=";
           const int64_t expr_tag_len = static_cast<int64_t>(strlen(expr_tag));
           if (state_cmt.length() > retry_tag_len
-              && 0 == state_cmt.compare(ObString(static_cast<int32_t>(retry_tag_len), retry_tag))) {
+              && 0 == memcmp(state_cmt.ptr(), retry_tag, static_cast<size_t>(retry_tag_len))) {
             max_retries = atoll(state_cmt.ptr() + retry_tag_len);
           }
           if (req_cmt.length() > expr_tag_len
-              && 0 == req_cmt.compare(ObString(static_cast<int32_t>(expr_tag_len), expr_tag))) {
+              && 0 == memcmp(req_cmt.ptr(), expr_tag, static_cast<size_t>(expr_tag_len))) {
             norm_expr.assign_ptr(req_cmt.ptr() + expr_tag_len,
                                  req_cmt.length() - static_cast<int32_t>(expr_tag_len));
           }
           sql.reset();
           if (OB_FAIL(sql.add_pk_column("table_id", table_schema.get_table_id()))) {
           } else if (OB_FAIL(sql.add_pk_column("column_id", vis_col->get_column_id()))) {
-          } else if (OB_FAIL(sql.add_column("column_name", base_name))) {
+          } else if (OB_FAIL(sql.add_column("column_name", ObHexEscapeSqlStr(base_name)))) {
           } else if (OB_FAIL(sql.add_column("max_retries", max_retries))) {
-          } else if (OB_FAIL(sql.add_column("normalized_expr", norm_expr))) {
+          } else if (OB_FAIL(sql.add_column("normalized_expr", ObHexEscapeSqlStr(norm_expr)))) {
           } else if (OB_FAIL(sql.add_column("state_column_id", state_col->get_column_id()))) {
           } else if (OB_FAIL(sql.add_column("request_column_id", req_col->get_column_id()))) {
           } else if (OB_FAIL(sql.add_column("result_spec_column_id", spec_col->get_column_id()))) {
@@ -926,6 +927,8 @@ static int insert_ai_column_metadata(const ObTableSchema &table_schema,
           } else if (affected_rows <= 0) {
             ret = OB_ERR_UNEXPECTED;
           }
+          LOG_INFO("AICOL wrote row", "table_id", table_schema.get_table_id(),
+                   "column", base_name, "retry", max_retries, K(ret), K(affected_rows));
         }
       }
     }
@@ -935,10 +938,13 @@ static int insert_ai_column_metadata(const ObTableSchema &table_schema,
 
 int ObCreateTableHelper::operate_schemas_() {
   int ret = OB_SUCCESS;
+  LOG_INFO("AICOL enter operate_schemas_", "cols", arg_.schema_.get_column_count(),
+           "proxy_null", (NULL == sql_proxy_));
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_FAIL(inner_create_table_(&arg_.ddl_stmt_str_,
                                          replace_mock_fk_parent_table_id_))) {
-  } else if (OB_FAIL(insert_ai_column_metadata(arg_.schema_, *sql_proxy_))) {
+  } else if (!new_tables_.empty()
+             && OB_FAIL(insert_ai_column_metadata(new_tables_.at(0), *sql_proxy_))) {
   }
   return ret;
 }
