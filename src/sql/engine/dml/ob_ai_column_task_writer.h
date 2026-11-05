@@ -250,11 +250,28 @@ private:
   }
 
 public:
+  static int write_tasks_for_update(ObExecContext &exec_ctx,
+                                    const uint64_t table_id,
+                                    const ObIArray<uint64_t> &column_ids,
+                                    const ObChunkDatumStore::StoredRow *row)
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_ISNULL(row)) {
+      LOG_INFO("ai column task writer skip update: row is null", K(table_id));
+    } else {
+      LOG_INFO("ai column task writer update probe", K(table_id), "cells_cnt", row->cnt_);
+      ret = write_tasks_for_insert_impl(exec_ctx, table_id, column_ids, *row, true);
+    }
+    return ret;
+  }
+
   static int write_tasks_for_insert_impl(ObExecContext &exec_ctx,
                                          const uint64_t table_id,
                                          const ObIArray<uint64_t> &column_ids,
-                                         const ObChunkDatumStore::StoredRow &row)
+                                         const ObChunkDatumStore::StoredRow &row,
+                                          const bool filter_by_update = false)
   {
+    UNUSED(filter_by_update);
     int ret = OB_SUCCESS;
     uint64_t user_table_id = OB_INVALID_ID;
     ObSQLSessionInfo *session = exec_ctx.get_my_session();

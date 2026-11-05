@@ -309,7 +309,19 @@ OB_INLINE int ObTableUpdateOp::calc_tablet_loc(const ObUpdCtDef &upd_ctdef,
   return ret;
 }
 
-OB_INLINE int ObTableUpdateOp::update_row_to_das()
+OB_INLINE 
+uint64_t ObTableUpdateOp::ai_column_table_id()
+{
+  uint64_t table_id = common::OB_INVALID_ID;
+  ObTableUpdateOpInput *input = static_cast<ObTableUpdateOpInput *>(get_input());
+  ObDASTableLoc *loc = (NULL != input) ? input->get_table_loc() : NULL;
+  if (NULL != loc && NULL != loc->loc_meta_) {
+    table_id = loc->loc_meta_->ref_table_id_;
+  }
+  return table_id;
+}
+
+int ObTableUpdateOp::update_row_to_das()
 {
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.upd_ctdefs_.count(); ++i) {
@@ -332,6 +344,13 @@ OB_INLINE int ObTableUpdateOp::update_row_to_das()
       } else if (OB_FAIL(calc_tablet_loc(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::update_row(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc, dml_rtctx_,
                                                  modify_row.old_row_, modify_row.new_row_, modify_row.full_row_))) {
+      } else if (OB_FAIL(ObAIColumnTaskWriter::write_tasks_for_update(
+                        ctx_, ai_column_table_id(), upd_ctdef.column_ids_,
+                        nullptr == modify_row.new_row_
+                            ? (nullptr == modify_row.full_row_ ? modify_row.old_row_ : modify_row.full_row_)
+                            : modify_row.new_row_))) {
+        LOG_INFO("write ai column tasks for update failed", K(ret));
+        ret = OB_SUCCESS;
       } else if (need_after_row_process(upd_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       } else {
         ++upd_rtdef.found_rows_;

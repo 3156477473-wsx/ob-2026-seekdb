@@ -93,6 +93,7 @@ public:
 protected:
   int inner_open_with_das();
   int update_row_to_das();
+  uint64_t ai_column_table_id();
   int upd_rows_post_proc();
   int calc_tablet_loc(const ObUpdCtDef &upd_ctdef,
                       ObUpdRtDef &upd_rtdef,
