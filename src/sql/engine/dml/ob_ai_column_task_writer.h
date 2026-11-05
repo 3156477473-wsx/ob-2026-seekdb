@@ -55,6 +55,23 @@ private:
     return ret;
   }
 
+  static int canonical_table_id(share::schema::ObSchemaGetterGuard &guard,
+                                const ObTableSchema &schema,
+                                uint64_t &table_id)
+  {
+    int ret = OB_SUCCESS;
+    const ObTableSchema *canonical = NULL;
+    if (OB_FAIL(guard.get_table_schema(schema.get_database_id(),
+                                       schema.get_table_name_str(),
+                                       false, canonical))) {
+    } else if (OB_ISNULL(canonical)) {
+      ret = OB_TABLE_NOT_EXIST;
+    } else {
+      table_id = canonical->get_table_id();
+    }
+    return ret;
+  }
+
   static int build_rowkey_predicate(ObIAllocator &allocator,
                                     const ObTableSchema &table_schema,
                                     const ObIArray<uint64_t> &column_ids,
@@ -239,6 +256,7 @@ public:
                                          const ObChunkDatumStore::StoredRow &row)
   {
     int ret = OB_SUCCESS;
+    uint64_t user_table_id = OB_INVALID_ID;
     ObSQLSessionInfo *session = exec_ctx.get_my_session();
     transaction::ObTxDesc *tx_desc = NULL;
     storage::ObAccessService *access_service = NULL;
@@ -258,6 +276,8 @@ public:
       LOG_INFO("ai task table schema failed", K(ret), K(table_id));
     } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
       ret = OB_TABLE_NOT_EXIST;
+    } else if (OB_FAIL(canonical_table_id(guard, *table_schema, user_table_id))) {
+      LOG_INFO("ai task canonical id failed", K(ret), K(table_id));
     } else if (OB_FAIL(find_task_schema(guard, task_schema))) {
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
@@ -271,7 +291,7 @@ public:
           if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, column_ids, row, predicate))) {
             LOG_INFO("ai task predicate failed", K(ret), K(table_id),
                      "column_id", column->get_column_id());
-          } else if (OB_FAIL(write_one_row(table_id, *task_schema, *column, predicate,
+          } else if (OB_FAIL(write_one_row(user_table_id, *task_schema, *column, predicate,
                                            *tx_desc, *access_service))) {
             LOG_INFO("ai task write one row failed", K(ret), K(table_id),
                      "column_id", column->get_column_id());
