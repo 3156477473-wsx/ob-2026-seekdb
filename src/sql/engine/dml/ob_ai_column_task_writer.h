@@ -282,7 +282,10 @@ public:
     } else {
       LOG_INFO("ai task ids", K(table_id), K(user_table_id),
                "db_id", table_schema->get_database_id(),
-               "name", table_schema->get_table_name_str());
+               "name", table_schema->get_table_name_str(),
+               "schema_table_id", table_schema->get_table_id(),
+               "has_partition", table_schema->has_partition(),
+               "schema_version", table_schema->get_schema_version());
       for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
         const ObColumnSchemaV2 *column = table_schema->get_column_schema_by_idx(i);
         if (OB_ISNULL(column)) {
