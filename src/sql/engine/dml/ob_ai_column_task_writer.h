@@ -280,6 +280,9 @@ public:
       LOG_INFO("ai task canonical id failed", K(ret), K(table_id));
     } else if (OB_FAIL(find_task_schema(guard, task_schema))) {
     } else {
+      LOG_INFO("ai task ids", K(table_id), K(user_table_id),
+               "db_id", table_schema->get_database_id(),
+               "name", table_schema->get_table_name_str());
       for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
         const ObColumnSchemaV2 *column = table_schema->get_column_schema_by_idx(i);
         if (OB_ISNULL(column)) {
