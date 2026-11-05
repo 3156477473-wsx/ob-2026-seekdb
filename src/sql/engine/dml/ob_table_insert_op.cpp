@@ -19,6 +19,7 @@
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "sql/engine/dml/ob_ai_column_task_writer.h"
 
 
 namespace oceanbase
@@ -226,6 +227,9 @@ OB_INLINE int ObTableInsertOp::insert_row_to_das()
                                                                 tablet_loc->tablet_id_,
                                                                 eval_ctx_))) {
       } else if (OB_FAIL(ObDMLService::insert_row(ins_ctdef, ins_rtdef, tablet_loc, dml_rtctx_, modify_row.new_row_))) {
+      } else if (OB_FAIL(ObAIColumnTaskWriter::write_tasks_for_insert_impl(
+                   ctx_, tablet_loc->loc_meta_->ref_table_id_, ins_ctdef.column_ids_,
+                   *modify_row.new_row_))) {
       } else if (need_after_row_process(ins_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       }
       if (OB_FAIL(ret)) {
