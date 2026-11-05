@@ -67,29 +67,37 @@ private:
     const ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
     for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_info.get_size(); ++i) {
       uint64_t rowkey_cid = OB_INVALID_ID;
-      int64_t row_idx = -1;
+      int64_t cell = -1;
       if (OB_FAIL(rowkey_info.get_column_id(i, rowkey_cid))) {
       } else {
-        for (int64_t idx = 0; idx < table_schema.get_column_count(); ++idx) {
-          const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(idx);
-          if (OB_NOT_NULL(column) && column->get_column_id() == rowkey_cid) {
-            row_idx = idx;
+        for (int64_t idx = 0; idx < column_ids.count(); ++idx) {
+          if (column_ids.at(idx) == rowkey_cid) {
+            cell = idx;
             break;
           }
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (row_idx < 0 || row_idx >= row.cnt_) {
+      } else if (cell < 0 || cell >= row.cnt_) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        const ObDatum &datum = row.cells()[row_idx];
-        if (i > 0 && OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, " AND "))) {
-        }
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "`%s` = ",
-                                           table_schema.get_column_schema_by_idx(row_idx)->get_column_name()))) {
-        } else if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "%.*s",
-                                           static_cast<int>(datum.len_), datum.ptr_))) {
+        const ObDatum &datum = row.cells()[cell];
+        const ObColumnSchemaV2 *column = table_schema.get_column_schema(rowkey_cid);
+        if (OB_ISNULL(column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (i > 0 && OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, " AND "))) {
+        } else if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "`%.*s` = ",
+                                           column->get_column_name_str().length(),
+                                           column->get_column_name_str().ptr()))) {
+        } else if (ObIntType == column->get_data_type()
+                   || ObUInt64Type == column->get_data_type()
+                   || ObNumberType == column->get_data_type()) {
+          if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "%ld", datum.get_int()))) {
+          }
+        } else {
+          if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "%.*s",
+                                      static_cast<int>(datum.len_), datum.ptr_))) {
+          }
         }
       }
     }
@@ -152,11 +160,18 @@ private:
         const ObString ai_name = ai_column.get_column_name_str();
         if (OB_FAIL(ob_write_string(allocator, ai_name, short_name))) {
         } else {
+          const ObString hidden_name = ai_column.get_column_name_str();
+          const ObString base_name = hidden_name.length() > 9
+                                         ? ObString(hidden_name.length() - 9, hidden_name.ptr() + 9)
+                                         : hidden_name;
           for (int64_t i = 0; OB_SUCC(ret) && i < all_column_ids.count(); ++i) {
             const ObColumnSchemaV2 *column = table_schema.get_column_schema(all_column_ids.at(i));
             ObDatum &datum = datum_row.storage_datums_[i];
             if (OB_ISNULL(column)) {
               ret = OB_ERR_UNEXPECTED;
+            } else if (column->get_column_name_str().length() >= 4
+                       && 0 == strncmp(column->get_column_name_str().ptr(), "gmt_", 4)) {
+              datum.set_datetime(ObTimeUtility::current_time());
             } else if (0 == column->get_column_name_str().case_compare("table_id")) {
               datum.set_int(static_cast<int64_t>(table_id));
             } else if (0 == column->get_column_name_str().case_compare("column_id")) {
@@ -172,7 +187,7 @@ private:
             } else if (0 == column->get_column_name_str().case_compare("eligible_ts")) {
               datum.set_datetime(ObTimeUtility::current_time());
             } else if (0 == column->get_column_name_str().case_compare("column_name")) {
-              datum.set_string(short_name);
+              datum.set_string(base_name);
             } else {
               datum.set_null();
             }
@@ -211,9 +226,6 @@ private:
       const ObColumnSchemaV2 *column = table_schema.get_column_schema(all_ids.at(i));
       if (OB_ISNULL(column)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (column->get_column_name_str().length() >= 4
-                 && 0 == strncmp(column->get_column_name_str().ptr(), "gmt_", 4)) {
-        // maintained by the storage layer
       } else if (OB_FAIL(ids.push_back(all_ids.at(i)))) {
       }
     }
@@ -248,8 +260,8 @@ public:
       ret = OB_TABLE_NOT_EXIST;
     } else if (OB_FAIL(find_task_schema(guard, task_schema))) {
     } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
-        const ObColumnSchemaV2 *column = table_schema->get_column_schema(column_ids.at(i));
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column = table_schema->get_column_schema_by_idx(i);
         if (OB_ISNULL(column)) {
           ret = OB_ERR_UNEXPECTED;
         } else if (!is_ai_request_column(column->get_column_name_str())) {
