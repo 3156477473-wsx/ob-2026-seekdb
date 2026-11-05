@@ -231,6 +231,8 @@ class ObSchemaRefreshSchedulerAdapter;
 //   server.start(); // blocked only program is coming to stop
 //   server.destory();
 //
+class ObAIColumnWorker;
+
 class ObServer : public share::ObIMemstoreRuntime,
                  public data_plane::ObILockWaitService,
                  public data_plane::ObIMemoryPressureService,
@@ -417,6 +419,7 @@ private:
   volatile bool has_stopped_;
   bool has_destroy_;
   bool in_process_ = false;
+  ObAIColumnWorker *ai_column_worker_ = nullptr;
   int clients_fd_ = -1;
 #ifdef _WIN32
   HANDLE clients_h_ = INVALID_HANDLE_VALUE;

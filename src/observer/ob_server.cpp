@@ -29,6 +29,7 @@
 #include <thread>
 #include <cstdio>
 #include "observer/ob_server.h"
+#include "observer/ai_column_worker.h"
 #include "observer/ob_system_package_load_service.h"
 #include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_autoincrement_service.h"
@@ -1348,6 +1349,12 @@ int ObServer::start()
     set_stop();
   } else if (!stop_) {
     GCTX.status_ = SS_SERVING;
+    if (OB_SUCC(ret) && NULL == ai_column_worker_) {
+      ai_column_worker_ = new (std::nothrow) ObAIColumnWorker();
+    }
+    if (OB_SUCC(ret) && NULL != ai_column_worker_) {
+      ai_column_worker_->start();
+    }
     GCTX.start_service_time_ = start_service_time;
     FLOG_INFO("[OBSERVER_NOTICE] observer start service", "start_service_time", GCTX.start_service_time_);
     LOG_DBA_INFO_V2(OB_SERVER_START_SUCCESS,
