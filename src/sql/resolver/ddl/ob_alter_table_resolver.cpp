@@ -3391,6 +3391,109 @@ int ObAlterTableResolver::process_timestamp_column(ObColumnResolveStat &stat,
   return ret;
 }
 
+// AI columns added by ALTER TABLE need the same three hidden helper columns as
+// the ones created together with the table.
+static int append_ai_hidden_columns_for_alter(ObAlterTableStmt *stmt,
+                                              const ParseNode &column_node,
+                                              const ObString &base_name,
+                                              const bool is_json_col,
+                                              common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *ai_node = NULL;
+  int64_t max_retries = 0;
+  ObString expr_text;
+  if (OB_ISNULL(stmt) || T_COLUMN_DEFINITION != column_node.type_
+      || column_node.num_child_ < COLUMN_DEFINITION_NUM_CHILD) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ParseNode *attr_list = column_node.children_[2];
+    if (NULL != attr_list) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < attr_list->num_child_; ++i) {
+        ParseNode *attr = attr_list->children_[i];
+        if (NULL != attr && T_CONSTR_AI_COLUMN == attr->type_) {
+          ai_node = attr;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && NULL != ai_node && ai_node->num_child_ >= 1 && NULL != ai_node->children_[0]) {
+      ParseNode *expr_node = ai_node->children_[0];
+      expr_text.assign_ptr(expr_node->str_value_, static_cast<int32_t>(expr_node->str_len_));
+      ParseNode *opt_list = (ai_node->num_child_ >= 2) ? ai_node->children_[1] : NULL;
+      if (NULL != opt_list) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < opt_list->num_child_; ++i) {
+          ParseNode *opt = opt_list->children_[i];
+          if (NULL != opt && T_OP_EQ == opt->type_ && 2 == opt->num_child_
+              && NULL != opt->children_[0] && NULL != opt->children_[1]) {
+            const ParseNode *name_node = opt->children_[0];
+            if (name_node->str_len_ == static_cast<int64_t>(strlen("max_retries"))
+                && 0 == strncasecmp(name_node->str_value_, "max_retries", name_node->str_len_)) {
+              max_retries = opt->children_[1]->value_;
+            }
+          }
+        }
+      }
+      char name_buf[OB_MAX_COLUMN_NAME_LENGTH];
+      char cmt_buf[OB_MAX_COLUMN_NAME_LENGTH * 2];
+      for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
+        const char *prefix = (0 == k) ? "__ai_state_" : ((1 == k) ? "__ai_req_" : "__ai_spec_");
+        int64_t name_len = snprintf(name_buf, sizeof(name_buf), "%s%.*s", prefix,
+                                    base_name.length(), base_name.ptr());
+        if (name_len <= 0 || name_len >= static_cast<int64_t>(sizeof(name_buf))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          AlterColumnSchema hidden;
+          ObString hidden_name;
+          ObString hidden_cmt;
+          if (OB_FAIL(ob_write_string(allocator, ObString(name_len, name_buf), hidden_name))) {
+          } else if (0 == k) {
+            int64_t cmt_len = snprintf(cmt_buf, sizeof(cmt_buf), "ai:max_retries=%ld", max_retries);
+            if (OB_FAIL(ob_write_string(allocator, ObString(cmt_len, cmt_buf), hidden_cmt))) {
+            } else {
+              hidden.set_data_type(ObDateTimeType);
+              hidden.set_collation_type(CS_TYPE_BINARY);
+              hidden.set_charset_type(CHARSET_BINARY);
+            }
+          } else if (1 == k) {
+            int64_t cmt_len = snprintf(cmt_buf, sizeof(cmt_buf), "ai:expr=%.*s%s",
+                                       expr_text.length(), expr_text.ptr(),
+                                       is_json_col ? " %Return exactly one valid JSON value%" : "");
+            if (cmt_len <= 0 || cmt_len >= static_cast<int64_t>(sizeof(cmt_buf))) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_FAIL(ob_write_string(allocator, ObString(cmt_len, cmt_buf), hidden_cmt))) {
+            } else {
+              hidden.set_data_type(ObLongTextType);
+              hidden.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+              hidden.set_charset_type(CHARSET_UTF8MB4);
+            }
+          } else {
+            int64_t cmt_len = snprintf(cmt_buf, sizeof(cmt_buf), "ai:spec=%s", is_json_col ? "json" : "text");
+            if (OB_FAIL(ob_write_string(allocator, ObString(cmt_len, cmt_buf), hidden_cmt))) {
+            } else {
+              hidden.set_data_type(ObLongTextType);
+              hidden.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+              hidden.set_charset_type(CHARSET_UTF8MB4);
+            }
+          }
+          if (OB_SUCC(ret)) {
+            hidden.set_column_name(hidden_name);
+            hidden.set_nullable(true);
+            hidden.set_is_hidden(true);
+            hidden.set_comment(hidden_cmt);
+            ObAccuracy accuracy;
+            accuracy.set_length((1 == k) ? 65535 : 19);
+            hidden.set_accuracy(accuracy);
+            hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+            if (OB_FAIL(stmt->add_column(hidden))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnNameSet &add_column_names_set)
 {
   int ret = OB_SUCCESS;
@@ -3457,6 +3560,11 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (OB_FAIL(append_ai_hidden_columns_for_alter(alter_table_stmt,
+                                                               *node.children_[i],
+                                                               alter_column_schema.get_column_name_str(),
+                                                               ObJsonType == alter_column_schema.get_data_type(),
+                                                               *allocator_))) {
           }
         }
       }

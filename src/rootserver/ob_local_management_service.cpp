@@ -642,6 +642,104 @@ int ObLocalManagementService::parallel_ddl_pre_check_()
   return ret;
 }
 
+
+namespace
+{
+// Keep oceanbase.__all_ai_column in sync with the AI columns of a table. Called
+// after CREATE TABLE and ALTER TABLE committed, so the schema is visible.
+static int sync_ai_column_catalog(share::schema::ObMultiVersionSchemaService *schema_service,
+                                  common::ObMySQLProxy &sql_proxy,
+                                  const uint64_t table_id)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema *table_schema = NULL;
+  ObSchemaGetterGuard guard;
+  if (OB_INVALID_ID == table_id) {
+    // nothing to sync
+  } else if (OB_ISNULL(schema_service)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_service->get_runtime_schema_guard(guard))) {
+  } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
+    // nothing to sync
+  } else {
+    const char *req_prefix = "__ai_req_";
+    const int64_t req_prefix_len = 9;
+    ObSqlString del_sql;
+    int64_t affected = 0;
+    if (OB_FAIL(del_sql.append_fmt("delete from oceanbase.%s where table_id = %lu",
+                                   OB_ALL_AI_COLUMN_TNAME, table_id))) {
+    } else if (OB_FAIL(sql_proxy.write(del_sql.ptr(), affected))) {
+    } else {
+      int64_t ai_cnt = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *req_col = table_schema->get_column_schema_by_idx(i);
+        if (OB_ISNULL(req_col)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const ObString &col_name = req_col->get_column_name_str();
+          if (col_name.length() > req_prefix_len
+              && 0 == memcmp(col_name.ptr(), req_prefix, static_cast<size_t>(req_prefix_len))) {
+            ObString base_name(col_name.length() - static_cast<int32_t>(req_prefix_len),
+                               col_name.ptr() + req_prefix_len);
+            char state_name[OB_MAX_COLUMN_NAME_LENGTH];
+            char spec_name[OB_MAX_COLUMN_NAME_LENGTH];
+            int64_t state_len = snprintf(state_name, sizeof(state_name), "__ai_state_%.*s",
+                                         base_name.length(), base_name.ptr());
+            int64_t spec_len = snprintf(spec_name, sizeof(spec_name), "__ai_spec_%.*s",
+                                        base_name.length(), base_name.ptr());
+            const ObColumnSchemaV2 *state_col = NULL;
+            const ObColumnSchemaV2 *spec_col = NULL;
+            const ObColumnSchemaV2 *vis_col = NULL;
+            int64_t max_retries = 0;
+            ObString norm_expr;
+            if (state_len <= 0 || state_len >= static_cast<int64_t>(sizeof(state_name))
+                || spec_len <= 0 || spec_len >= static_cast<int64_t>(sizeof(spec_name))) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_ISNULL(state_col = table_schema->get_column_schema(state_name))
+                       || OB_ISNULL(spec_col = table_schema->get_column_schema(spec_name))
+                       || OB_ISNULL(vis_col = table_schema->get_column_schema(base_name))) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              const ObString &state_cmt = state_col->get_comment_str();
+              const ObString &req_cmt = req_col->get_comment_str();
+              const char *retry_tag = "ai:max_retries=";
+              const char *expr_tag = "ai:expr=";
+              if (state_cmt.length() > static_cast<int64_t>(strlen(retry_tag))
+                  && 0 == memcmp(state_cmt.ptr(), retry_tag, strlen(retry_tag))) {
+                max_retries = atoll(state_cmt.ptr() + strlen(retry_tag));
+              }
+              if (req_cmt.length() > static_cast<int64_t>(strlen(expr_tag))
+                  && 0 == memcmp(req_cmt.ptr(), expr_tag, strlen(expr_tag))) {
+                norm_expr.assign_ptr(req_cmt.ptr() + strlen(expr_tag),
+                                     req_cmt.length() - static_cast<int32_t>(strlen(expr_tag)));
+              }
+              ObDMLSqlSplicer sql;
+              ObSqlString buffer;
+              if (OB_FAIL(sql.add_pk_column("table_id", table_id))) {
+              } else if (OB_FAIL(sql.add_pk_column("column_id", vis_col->get_column_id()))) {
+              } else if (OB_FAIL(sql.add_column("column_name", ObHexEscapeSqlStr(base_name)))) {
+              } else if (OB_FAIL(sql.add_column("max_retries", max_retries))) {
+              } else if (OB_FAIL(sql.add_column("normalized_expr", ObHexEscapeSqlStr(norm_expr)))) {
+              } else if (OB_FAIL(sql.add_column("state_column_id", state_col->get_column_id()))) {
+              } else if (OB_FAIL(sql.add_column("request_column_id", req_col->get_column_id()))) {
+              } else if (OB_FAIL(sql.add_column("result_spec_column_id", spec_col->get_column_id()))) {
+              } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+              } else if (OB_FAIL(sql_proxy.write(buffer.ptr(), affected))) {
+              } else {
+                ++ai_cnt;
+              }
+            }
+          }
+        }
+      }
+      LOG_INFO("AICOL sync catalog done", K(table_id), K(ai_cnt), K(ret));
+    }
+  }
+  return ret;
+}
+}  // namespace
+
 int ObLocalManagementService::parallel_create_table(const ObCreateTableArg &arg, ObCreateTableRes &res)
 {
   int64_t begin_time = ObTimeUtility::current_time();
@@ -663,6 +761,9 @@ int ObLocalManagementService::parallel_create_table(const ObCreateTableArg &arg,
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(create_table_helper.init(ddl_service_))) {
     } else if (OB_FAIL(create_table_helper.execute())) {
+    } else if (OB_FAIL(sync_ai_column_catalog(schema_service_,
+                                              ddl_service_.get_sql_proxy(),
+                                              res.table_id_))) {
     }
   }
   int64_t cost = ObTimeUtility::current_time() - begin_time;
@@ -693,6 +794,9 @@ int ObLocalManagementService::create_table(const ObCreateTableArg &arg, ObCreate
     ObCreateTableHelper create_table_helper(schema_service_, arg, res, nullptr/*external trans*/, false /*is_parallel*/);
     if (OB_FAIL(create_table_helper.init(ddl_service_))) {
     } else if (OB_FAIL(create_table_helper.execute())) {
+    } else if (OB_FAIL(sync_ai_column_catalog(schema_service_,
+                                              ddl_service_.get_sql_proxy(),
+                                              res.table_id_))) {
     }
   }
   int64_t cost = ObTimeUtility::current_time() - begin_time;
@@ -1059,6 +1163,11 @@ int ObLocalManagementService::alter_table(const obcall::ObAlterTableArg &arg, ob
         res.schema_version_ = simple_table_schema->get_schema_version();
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    const uint64_t altered_table_id = arg.alter_table_schema_.get_table_id();
+    int tmp_ret = sync_ai_column_catalog(schema_service_, ddl_service_.get_sql_proxy(), altered_table_id);
+    LOG_INFO("AICOL alter sync catalog", K(tmp_ret), K(altered_table_id));
   }
   char table_id_buffer[256];
   snprintf(table_id_buffer, sizeof(table_id_buffer), "table_id:%ld, hidden_table_id:%ld",

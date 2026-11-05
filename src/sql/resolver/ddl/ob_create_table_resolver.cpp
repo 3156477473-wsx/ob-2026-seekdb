@@ -1152,11 +1152,10 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           const int64_t declared_dim = ai_declared_vector_dim(ai_element);
           const int64_t embed_dim = ai_embed_declared_dim(expr_text);
           for (int64_t k = 0; OB_SUCC(ret) && k < ai_names.count(); ++k) {
-            if (k == col_index) {
+            if (0 == ai_names.at(k).case_compare(ai_col_name)) {
               continue;
             } else if (ai_expr_has_ident(expr_text, ai_names.at(k))) {
               ret = OB_NOT_SUPPORTED;
-              LOG_USER_ERROR(OB_NOT_SUPPORTED, "ai column depending on another ai column");
             }
           }
           if (OB_SUCC(ret) && declared_dim >= 0 && embed_dim >= 0 && declared_dim != embed_dim) {
