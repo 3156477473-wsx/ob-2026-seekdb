@@ -14,6 +14,7 @@
 #include "storage/ob_value_row_iterator.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/tx/ob_trans_service.h"
+#include "share/schema/ob_multi_version_schema_service.h"
 #include "sql/das/ob_das_define.h"
 
 namespace oceanbase
@@ -116,12 +117,22 @@ private:
     storage::ObValueRowIterator row_iter;
     ObArenaAllocator datum_allocator("AIColDatum");
 
-    if (OB_FAIL(ai_column_table_all_ids(table_schema, all_column_ids))) {
+    transaction::ObTransService *txs = NULL;
+    if (OB_ISNULL(txs = share::server_service<transaction::ObTransService>())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(txs->get_read_snapshot(tx_desc,
+                                              transaction::ObTxIsolationLevel::RC,
+                                              THIS_WORKER.get_timeout_ts(),
+                                              snapshot))) {
+      LOG_INFO("ai task get snapshot failed", K(ret));
+    } else if (OB_FAIL(ai_column_table_all_ids(table_schema, all_column_ids))) {
     } else if (OB_FAIL(table_param.convert(&table_schema, table_schema.get_schema_version(),
                                            all_column_ids))) {
+      LOG_INFO("ai task convert failed", K(ret), K(all_column_ids.count()));
     } else if (OB_FAIL(access_service.get_write_store_ctx_guard(
                  THIS_WORKER.get_timeout_ts(), tx_desc, snapshot, 0,
                  dml_param.write_flag_, store_ctx_guard))) {
+      LOG_INFO("ai task store ctx failed", K(ret));
     } else if (OB_FAIL(dml_param.snapshot_.assign(snapshot))) {
     } else {
       dml_param.sql_mode_ = SMO_DEFAULT;
@@ -171,6 +182,8 @@ private:
           } else if (OB_FAIL(row_iter.add_row(datum_row))) {
           } else {
             int64_t affected_rows = 0;
+            LOG_INFO("ai task before insert", K(table_id), K(all_column_ids.count()),
+                     "tablet", table_schema.get_tablet_id().id());
             if (OB_FAIL(access_service.insert_rows(table_schema.get_tablet_id(), tx_desc, dml_param,
                                                    all_column_ids, &row_iter, affected_rows))) {
               LOG_INFO("insert ai column task row failed", K(ret), K(table_id));
@@ -190,7 +203,21 @@ private:
   static int ai_column_table_all_ids(const ObTableSchema &table_schema,
                                      ObIArray<uint64_t> &ids)
   {
-    return table_schema.get_all_column_ids(ids);
+    int ret = OB_SUCCESS;
+    ObSEArray<uint64_t, 16> all_ids;
+    if (OB_FAIL(table_schema.get_all_column_ids(all_ids))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < all_ids.count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema.get_column_schema(all_ids.at(i));
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->get_column_name_str().length() >= 4
+                 && 0 == strncmp(column->get_column_name_str().ptr(), "gmt_", 4)) {
+        // maintained by the storage layer
+      } else if (OB_FAIL(ids.push_back(all_ids.at(i)))) {
+      }
+    }
+    return ret;
   }
 
 public:
@@ -212,7 +239,11 @@ public:
     } else if (OB_ISNULL(access_service =
                  share::server_service<storage::ObAccessService>())) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(share::schema::ObMultiVersionSchemaService::get_instance()
+                          .get_runtime_schema_guard(guard))) {
+      LOG_INFO("ai task guard init failed", K(ret));
     } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
+      LOG_INFO("ai task table schema failed", K(ret), K(table_id));
     } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
       ret = OB_TABLE_NOT_EXIST;
     } else if (OB_FAIL(find_task_schema(guard, task_schema))) {
@@ -226,8 +257,12 @@ public:
         } else {
           ObString predicate;
           if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, column_ids, row, predicate))) {
+            LOG_INFO("ai task predicate failed", K(ret), K(table_id),
+                     "column_id", column->get_column_id());
           } else if (OB_FAIL(write_one_row(table_id, *task_schema, *column, predicate,
                                            *tx_desc, *access_service))) {
+            LOG_INFO("ai task write one row failed", K(ret), K(table_id),
+                     "column_id", column->get_column_id());
           }
         }
       }
