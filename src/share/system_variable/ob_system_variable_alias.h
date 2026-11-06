@@ -121,6 +121,7 @@ namespace share
   static const char* const OB_SV_PROFILING_HISTORY_SIZE = "profiling_history_size";
   static const char* const OB_SV_ENABLE_FILE_SQL = "enable_file_sql";
   static const char* const OB_SV_LOG_LEVEL = "ob_log_level";
+  static const char* const OB_SV_AI_COLUMN_STRICT_READ = "ai_column_strict_read";
   static const char* const OB_SV_QUERY_TIMEOUT = "ob_query_timeout";
   static const char* const OB_SV_READ_CONSISTENCY = "ob_read_consistency";
   static const char* const OB_SV_ENABLE_TRANSFORMATION = "ob_enable_transformation";

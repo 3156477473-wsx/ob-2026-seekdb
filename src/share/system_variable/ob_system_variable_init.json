@@ -10988,5 +10988,18 @@
     "info_cn": "开启后可用 read_csv/read_json/read_parquet/glob 直接查询本地文件",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10004,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "reject reads of AI columns whose values are not ready",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "开启后，读取未就绪的 AI 列会报 11120",
+    "background_cn": "",
+    "ref_url": ""
   }
 }
