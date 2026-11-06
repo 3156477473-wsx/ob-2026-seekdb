@@ -96,6 +96,35 @@ private:
     return out;
   }
 
+  // Extract the first embedding array from an OpenAI compatible response body.
+  static std::string pick_embedding(const std::string &body)
+  {
+    std::string out;
+    size_t pos = body.find("\"embedding\"");
+    if (std::string::npos == pos) {
+      return out;
+    }
+    size_t open = body.find('[', pos);
+    if (std::string::npos == open) {
+      return out;
+    }
+    size_t close = body.find(']', open);
+    if (std::string::npos == close) {
+      return out;
+    }
+    out.reserve(close - open + 1);
+    out += '[';
+    for (size_t i = open + 1; i < close; ++i) {
+      const char c = body[i];
+      if (' ' == c || '\n' == c || '\t' == c) {
+        continue;
+      }
+      out += c;
+    }
+    out += ']';
+    return out;
+  }
+
   // Extract "content" from an OpenAI compatible response body.
   static std::string pick_content(const std::string &body)
   {
@@ -439,7 +468,14 @@ private:
                 ? "Return exactly one base-10 integer value when the column type is an integer."
                 : (json_hint ? "Return exactly one valid JSON value when the column type is JSON."
                              : "Answer with one short plain-text line.");
-        std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + std::string(sys_prompt) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user_text) + "\"}]}";
+        const bool is_embed = (std::string::npos != expr.find("AI_EMBED"));
+        std::string body;
+        if (is_embed) {
+          body = "{\"model\":\"" + json_escape(model) + "\",\"input\":\"" + json_escape(user_text)
+                 + "\"}";
+        } else {
+          body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + std::string(sys_prompt) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user_text) + "\"}]}";
+        }
         std::string auth = "Authorization: Bearer " + access_key;
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -481,7 +517,7 @@ private:
           }
           return common::OB_SUCCESS;
         }
-        answer = pick_content(buf.data);
+        answer = is_embed ? pick_embedding(buf.data) : pick_content(buf.data);
       }
     }
 
