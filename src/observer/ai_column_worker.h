@@ -149,6 +149,7 @@ private:
     if (NULL == GCTX.sql_proxy_) {
       ret = common::OB_NOT_INIT;
     } else {
+      std::vector<PreparedTask> batch;
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
         sqlclient::ObMySQLResult *result = NULL;
         const char *sql =
@@ -183,13 +184,18 @@ private:
             std::string s_rowkey(rowkey.ptr(), rowkey.length());
             std::string s_col(col.ptr(), col.length());
             std::string s_rc(rc.ptr(), rc.length());
-            int tmp = handle_task(s_tid, s_rowkey, s_col, s_rc);
+            std::string s_rid(rid.ptr(), rid.length());
+            PreparedTask prepared;
+            int tmp = handle_task(s_tid, s_rowkey, s_col, s_rc, s_rid, prepared);
             if (common::OB_SUCCESS != tmp) {
               LOG_INFO("ai column worker handle task failed", K(tmp));
+            } else if (prepared.ready) {
+              batch.push_back(prepared);
             }
           }
         }
       }
+      apply_prepared(batch);
     }
     return ret;
   }
@@ -253,10 +259,26 @@ private:
     }
   }
 
+  struct PreparedTask
+  {
+    bool ready;
+    std::string table_id;
+    std::string rowkey;
+    std::string column_name;
+    std::string db_name;
+    std::string table_name;
+    std::string answer;
+    std::string request_id;
+    std::string base_value;
+    PreparedTask() : ready(false) {}
+  };
+
   int handle_task(const std::string &table_id,
                   const std::string &rowkey,
                   const std::string &column_name,
-                  const std::string &retry_count)
+                  const std::string &retry_count,
+                  const std::string &request_id,
+                  PreparedTask &prepared)
   {
     int ret = common::OB_SUCCESS;
     std::string db_name;
@@ -377,6 +399,7 @@ private:
 
     // input text from the user row
     std::string user_text;
+    std::string prepared_base_value;
     if (!url.empty()) {
       common::ObSqlString sql;
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
@@ -390,6 +413,7 @@ private:
           common::ObString v;
           if (OB_SUCC(result->get_varchar("content", v))) {
             user_text = prefix + std::string(v.ptr(), v.length());
+            prepared_base_value = std::string(v.ptr(), v.length());
           }
         }
       }
@@ -462,25 +486,147 @@ private:
     }
 
     if (!answer.empty()) {
-      common::ObSqlString upd;
-      if (OB_SUCC(upd.assign_fmt("update `%s`.`%s` set `%s` = '%s' where %s",
-                                 db_name.c_str(), table_name.c_str(), column_name.c_str(),
-                                 sql_escape(answer).c_str(), rowkey.c_str()))) {
-        int64_t affected = 0;
-        int tmp = GCTX.sql_proxy_->write(upd.ptr(), affected);
-        LOG_INFO("ai column worker write back", K(tmp), K(affected), K(column_name.c_str()));
+      prepared.table_id = table_id;
+      prepared.rowkey = rowkey;
+      prepared.column_name = column_name;
+      prepared.db_name = db_name;
+      prepared.table_name = table_name;
+      prepared.answer = answer;
+      prepared.request_id = request_id;
+      prepared.base_value = prepared_base_value;
+      prepared.ready = true;
+    }
+    return common::OB_SUCCESS;
+  }
+
+  // All AI columns of the same row are applied with a single UPDATE so readers
+  // never observe a row where only part of the AI columns is filled.
+  void apply_prepared(std::vector<PreparedTask> &batch)
+  {
+    int ret = common::OB_SUCCESS;
+    for (size_t i = 0; i < batch.size(); ++i) {
+      if (!batch[i].ready) {
+        continue;
+      }
+      std::string columns_sql;
+      std::string delete_sql;
+      std::string db_name = batch[i].db_name;
+      std::string table_name = batch[i].table_name;
+      std::string rowkey = batch[i].rowkey;
+      std::string table_id = batch[i].table_id;
+      for (size_t j = i; j < batch.size(); ++j) {
+        if (!batch[j].ready || batch[j].db_name != db_name || batch[j].table_name != table_name
+            || batch[j].rowkey != rowkey || batch[j].table_id != table_id) {
+          continue;
+        }
+        if (!columns_sql.empty()) {
+          columns_sql += ", ";
+        }
+        columns_sql += "`" + batch[j].column_name + "` = '" + sql_escape(batch[j].answer) + "'";
+        if (!delete_sql.empty()) {
+          delete_sql += " or ";
+        }
+        delete_sql += "column_name = '" + batch[j].column_name + "'";
+        batch[j].ready = false;
+      }
+      // A newer task for the same row/column means this answer is stale.
+      bool superseded = false;
+      bool saw_current = false;
+      {
+        common::ObSqlString cur;
+        SMART_VAR(ObMySQLProxy::MySQLResult, rres) {
+          sqlclient::ObMySQLResult *rresult = NULL;
+          if (OB_SUCC(cur.assign_fmt("select content from `%s`.`%s` where %s limit 1",
+                                     batch[i].db_name.c_str(), batch[i].table_name.c_str(),
+                                     rowkey.c_str()))) {
+            if (OB_SUCC(GCTX.sql_proxy_->read(rres, cur.ptr()))) {
+              rresult = rres.get_result();
+              if (NULL != rresult && OB_SUCC(rresult->next())) {
+                common::ObString cv;
+                if (OB_SUCC(rresult->get_varchar("content", cv))) {
+                  saw_current = true;
+                  superseded = (batch[i].base_value != std::string(cv.ptr(), cv.length()));
+                  LOG_INFO("ai column guard check", K(batch[i].base_value.c_str()),
+                           K(std::string(cv.ptr(), cv.length()).c_str()), K(superseded));
+                }
+              }
+            }
+          }
+        }
+      }
+      for (size_t k = i; !superseded && k < batch.size(); ++k) {
+        (void)k;
+        break;
+      }
+      {
+        common::ObSqlString chk;
+        SMART_VAR(ObMySQLProxy::MySQLResult, cres) {
+          sqlclient::ObMySQLResult *cresult = NULL;
+          if (OB_SUCC(chk.assign_fmt(
+                  "select count(*) as newer from oceanbase.__all_ai_column_task "
+                  "where table_id = %s and rowkey_predicate = '%s' and request_id > %s",
+                  table_id.c_str(), sql_escape(rowkey).c_str(),
+                  batch[i].request_id.c_str()))) {
+            if (OB_SUCC(GCTX.sql_proxy_->read(cres, chk.ptr()))) {
+              cresult = cres.get_result();
+              if (NULL != cresult && OB_SUCC(cresult->next())) {
+                int64_t newer = 0;
+                if (OB_SUCC(cresult->get_int("newer", newer))) {
+                  superseded = (newer > 0);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (!saw_current) {
+        LOG_INFO("ai column guard saw no row", K(rowkey.c_str()));
+      }
+      if (superseded) {
+        LOG_INFO("ai column worker skip stale answer", K(rowkey.c_str()),
+                 K(batch[i].request_id.c_str()));
+        std::string stale_delete;
+        for (size_t k = i; k < batch.size(); ++k) {
+          if (!batch[k].ready || batch[k].request_id != batch[i].request_id
+              || batch[k].rowkey != rowkey || batch[k].table_id != table_id) {
+            continue;
+          }
+          if (!stale_delete.empty()) {
+            stale_delete += " or ";
+          }
+          stale_delete += "column_name = '" + batch[k].column_name + "'";
+          batch[k].ready = false;
+        }
         common::ObSqlString del;
         if (OB_SUCC(del.assign_fmt("delete from oceanbase.__all_ai_column_task where table_id = %s "
-                                   "and rowkey_predicate = '%s' and column_name = '%s'",
+                                   "and rowkey_predicate = '%s' and request_id = %s and (%s)",
                                    table_id.c_str(), sql_escape(rowkey).c_str(),
-                                   column_name.c_str()))) {
+                                   batch[i].request_id.c_str(), stale_delete.c_str()))) {
+          int64_t delcnt = 0;
+          int tmp2 = GCTX.sql_proxy_->write(del.ptr(), delcnt);
+          LOG_INFO("ai column worker stale task dropped", K(tmp2), K(delcnt));
+        }
+        continue;
+      }
+      common::ObSqlString upd;
+      if (OB_SUCC(upd.assign_fmt("update `%s`.`%s` set %s where %s", db_name.c_str(),
+                                 table_name.c_str(), columns_sql.c_str(), rowkey.c_str()))) {
+        int64_t affected = 0;
+        int tmp = GCTX.sql_proxy_->write(upd.ptr(), affected);
+        LOG_INFO("ai column worker write back", K(tmp), K(affected), K(columns_sql.c_str()));
+        common::ObSqlString del;
+        if (OB_SUCC(del.assign_fmt("delete from oceanbase.__all_ai_column_task where table_id = %s "
+                                   "and rowkey_predicate = '%s' and request_id = %s and (%s)",
+                                   table_id.c_str(), sql_escape(rowkey).c_str(),
+                                   batch[i].request_id.c_str(), delete_sql.c_str()))) {
           int64_t delcnt = 0;
           int tmp2 = GCTX.sql_proxy_->write(del.ptr(), delcnt);
           LOG_INFO("ai column worker task dropped", K(tmp2), K(delcnt));
         }
+      } else {
+        LOG_INFO("ai column worker batch update failed", K(columns_sql.c_str()));
       }
     }
-    return common::OB_SUCCESS;
   }
 
   std::atomic<bool> stop_;
