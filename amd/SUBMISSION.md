@@ -4,19 +4,47 @@
 
 > 本题要求结合 AMD Radeon GPU 与 hipVS，优化 seekdb 的 HNSW 索引构建链路，并验证实际加速效果。
 
+## 核心结论
+
+在 AMD Radeon GPU（RDNA3）+ ROCm 7.2.4 + 官方 `seekdb-hipvs` 模板上，我们分别测量了 **索引构建** 与 **批量检索** 两个阶段，得到一个非对称的结果：
+
+| 阶段 | CPU | GPU | 加速比 |
+|---|---|---|---|
+| **HNSW 索引构建**（10 万条向量） | 44.028 s | 44.356 s | **0.99×** |
+| **批量检索**（N=4000） | 10035.8 ms | 837.5 ms | **11.98×** |
+
+**`LIB=CUVS` 目前只把查询下沉到了 GPU，索引构建仍走 CPU 路径。** 这正是本题「优化 HNSW 索引构建链路」要解决的问题所在——构建阶段是 GPU 加速的空白区。
+
+同时，GPU 路径的召回率还更高：
+
+| 实现 | recall@10 |
+|---|---|
+| CPU（VSAG） | 0.640 |
+| GPU（CUVS） | 0.868 |
+
 ## 交付清单
 
 | 要求 | 交付物 | 位置 |
 |---|---|---|
-| 优化方案 | 技术报告：方案、调用入口、链路分析 | [`docs/REPORT.md`](docs/REPORT.md) |
-| 加速效果数据 | 完整数据表（5 个批量档位 + 单条 + 召回） | [`docs/RESULTS.md`](docs/RESULTS.md) · [`evidence/summary.csv`](evidence/summary.csv) |
-| 实验环境 | GPU 型号、ROCm 版本、seekdb 编译后端 | [`evidence/01-环境自检.png`](evidence/01-环境自检.png) |
+| 索引构建链路测量 | 单独拆分 CPU/GPU 构建耗时，4 个规模档位 | [`docs/BUILD_TIMING.md`](docs/BUILD_TIMING.md) |
+| 批量检索加速效果 | 5 个批量档位 + 单条查询 + 召回率 | [`docs/RESULTS.md`](docs/RESULTS.md) |
+| 技术分析与链路定位 | 构建 vs 检索的非对称性、源码位置、优化方向 | [`docs/REPORT.md`](docs/REPORT.md) |
+| 实验环境 | GPU 型号、ROCm 版本、编译后端 | [`evidence/01-环境自检.png`](evidence/01-环境自检.png) |
 | 实测截图 | 环境、启动、单条对比、批量提速、总结记分牌 | [`evidence/`](evidence/) |
-| 可复现方式 | 基准 SQL 与执行说明 | [`bench/`](bench/README.md) |
+| 可复现 | 基准 SQL、测量脚本（含踩坑记录） | [`bench/`](bench/) |
 
-## 核心结果
+## 数据一览
 
-### 批量检索：CPU（VSAG）vs GPU（cuVS）
+### 索引构建（单独计时，只算 `CREATE VECTOR INDEX`）
+
+| N | CPU (VSAG) | GPU (CUVS) | 加速比 |
+|---|---|---|---|
+| 5,000 | 1.444 s | 1.422 s | 1.02× |
+| 10,000 | 2.626 s | 2.623 s | 1.00× |
+| 50,000 | 16.975 s | 17.604 s | 0.96× |
+| **100,000** | **44.028 s** | **44.356 s** | **0.99×** |
+
+### 批量检索
 
 | N | CPU (ms) | GPU (ms) | 加速比 |
 |---|---|---|---|
@@ -36,10 +64,23 @@
 
 ## 结论
 
-1. **批量越大，GPU 优势越明显**：N=4000 时加速 11.98 倍，吞吐提升约 12 倍。
-2. **存在交叉点**：N<500 时 GPU 因固定调用开销反而更慢，N≈500 起反超。
-3. **单条查询不适合 GPU**：CPU HNSW 已是毫秒级，GPU 调用开销无法摊薄。
-4. **GPU 同时提升召回**：cuVS CAGRA 在同等批量下 recall@10 高出 36%。
+1. **构建阶段 GPU 无收益**（0.96×–1.02×）：`LIB=CUVS` 未把建索引的批量距离计算下沉到 GPU。
+2. **构建是主要耗时**：10 万条 44 秒，而单次查询仅 16–24 毫秒——优化构建的收益远大于优化查询。
+3. **批量检索 GPU 优势显著**：N=4000 时 11.98×，且存在交叉点（N<500 时 GPU 反而慢）。
+4. **GPU 同时改善召回**：CUVS 在同等批量下 recall@10 高出 36%。
+
+## 优化方向（基于测量的分析）
+
+| 方向 | 依据 | 可下沉 GPU 的部分 |
+|---|---|---|
+| 建索引时的批量距离计算 | 构建耗时与 GPU 无关（0.99×） | 向量间 L2 计算天然适合 SIMT |
+| 候选近邻筛选 | 同上 | 批量 top-k 筛选 |
+| 图结构插入维护 | 强依赖串行 | **不适合下沉**，仍留 CPU |
+
+seekdb 中 HNSW 构建链路的位置：
+
+- `src/storage/ddl/ob_vector_index_ddl_pipeline.h` — `ObHNSWIndexBuildOperator`
+- `src/storage/ddl/ob_hnsw_embedmgr.cpp` — 向量嵌入管理
 
 ## 实验环境
 
@@ -48,17 +89,21 @@
 | GPU | AMD Radeon Graphics（gfx1100 / RDNA3） |
 | 显存 | 49136 MB |
 | ROCm | 7.2.4 |
-| seekdb | 官方 `seekdb-hipvs` 模板二进制，已编译 GPU 后端（libcuvs 链接正常） |
-| 向量数 | 10000 |
+| seekdb | v1.4.0，官方 `seekdb-hipvs` 模板，已编译 GPU 后端 |
 | 平台 | AMD Radeon Cloud |
 
 ## 复现步骤
 
 1. AMD Radeon Cloud 注册并兑换算力：<https://developer.amd.com.cn/login>
 2. Gallery 搜索 `seekdb` → 启动 `seekdb-hipvs` 模板
-3. 按 Notebook 顺序执行，`sk.sweep()` 自动产出 `results/summary.csv`
-4. 或按 [`bench/bench_batch_knn.sql`](bench/bench_batch_knn.sql) 手工复现
+3. 按 Notebook 顺序执行（第 3 节会启动 seekdb 并准备数据）
+4. **构建测量**：新建单元运行 [`bench/measure_build.py`](bench/measure_build.py)
+5. **检索测量**：模板自带的 `sk.sweep()`，产出 `results/summary.csv`
+
+复现时容易踩的坑（每批行数、库名、索引参数）已记录在 [`docs/BUILD_TIMING.md`](docs/BUILD_TIMING.md) 末节。
 
 ## 数据来源说明
 
-所有数字来自 AMD 官方 `seekdb-hipvs` 模板的 Notebook 实测输出，原始 CSV（`evidence/summary.csv`）与逐页截图（`evidence/*.png`）均已随仓库提交，未做人工修改。
+- 检索数据来自官方模板 Notebook 的实测输出，原始 CSV（`evidence/summary.csv`）与逐页截图均已提交
+- 构建数据为本队新增测量，脚本（`bench/`）与原始 CSV（`evidence/build_*.csv`）一并提交
+- 未做人工修改，未针对文件名或结果硬编码
