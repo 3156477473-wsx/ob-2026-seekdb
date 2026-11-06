@@ -41,6 +41,7 @@ public:
         ctx_(nullptr),
         hub_(hub),
         segmenters_(allocator_),
+        segmenter_cnt_(0),
         cache_main_(allocator),
         cache_quan_(allocator),
         cache_stop_(allocator),
@@ -48,6 +49,9 @@ public:
         dict_quan_(nullptr),
         dict_stop_(nullptr)
   {
+    for (int i = 0; i < SEGMENTER_CNT_MAX; ++i) {
+      segmenter_arr_[i] = nullptr;
+    }
   }
 
   virtual ~ObIKFTParser() { reset(); }
@@ -97,6 +101,14 @@ private:
   TokenizeContext *ctx_;
   ObFTDictHub *hub_;
   ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+
+  // 热路径优化：init_segmenter() 之后把 segmenters_ 的内容摊平成定长数组，
+  // process_one_char() 改为直接遍历数组，避免每处理一个字符都走一次
+  // ObList 迭代器（含指针跳转与迭代器状态维护）。
+  // 数量固定为 4（letter / quantifier / cjk / surrogate），顺序即执行顺序。
+  static constexpr int SEGMENTER_CNT_MAX = 4;
+  ObIIKProcessor *segmenter_arr_[SEGMENTER_CNT_MAX];
+  int segmenter_cnt_;
 
   // For now there's no change of dict in one query, so we can pin dict this level.
   ObFTCacheRangeContainer cache_main_;

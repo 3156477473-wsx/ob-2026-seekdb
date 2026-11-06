@@ -134,11 +134,13 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+  // 直接遍历定长数组，避免 ObList 迭代器带来的额外开销。
+  // 数组在 init_segmenter() 中一次性填充，顺序与 push_back 顺序一致。
+  for (int i = 0; OB_SUCC(ret) && i < segmenter_cnt_; ++i) {
+    ObIIKProcessor *seg = segmenter_arr_[i];
+    if (OB_ISNULL(seg)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(seg->process(ctx))) {
     }
   }
   return ret;
@@ -343,6 +345,17 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     OB_DELETEx(ObIKQuantifierProcessor, &allocator_, cnqsg);
     OB_DELETEx(ObIKCJKProcessor, &allocator_, cjksg);
     OB_DELETEx(ObIKSurrogateProcessor, &allocator_, surrogate_seg);
+  } else {
+    // 把链表内容摊平到定长数组，供热路径 process_one_char() 直接遍历。
+    segmenter_cnt_ = 0;
+    for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+         OB_SUCC(ret) && iter != segmenters_.end() && segmenter_cnt_ < SEGMENTER_CNT_MAX;
+         iter++) {
+      segmenter_arr_[segmenter_cnt_++] = *iter;
+    }
+    if (OB_SUCC(ret) && segmenter_cnt_ == 0) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   }
   return ret;
 }
@@ -361,6 +374,11 @@ void ObIKFTParser::reset()
     }
   }
   segmenters_.clear();
+  // 数组里存的是同样的指针，对象已在上面释放，这里只清指针避免悬垂。
+  for (int i = 0; i < SEGMENTER_CNT_MAX; ++i) {
+    segmenter_arr_[i] = nullptr;
+  }
+  segmenter_cnt_ = 0;
 
   cache_main_.reset();
   cache_quan_.reset();
