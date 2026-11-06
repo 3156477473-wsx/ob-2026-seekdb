@@ -106,9 +106,9 @@ private:
         } else if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "`%.*s` = ",
                                            column->get_column_name_str().length(),
                                            column->get_column_name_str().ptr()))) {
-        } else if (ObIntType == column->get_data_type()
-                   || ObUInt64Type == column->get_data_type()
-                   || ObNumberType == column->get_data_type()) {
+        } else if (ob_is_integer_type(column->get_data_type())
+                   || ObNumberType == column->get_data_type()
+                   || ObDecimalIntType == column->get_data_type()) {
           if (OB_FAIL(databuff_printf(buffer, sizeof(buffer), pos, "%ld", datum.get_int()))) {
           }
         } else {
