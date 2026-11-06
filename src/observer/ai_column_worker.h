@@ -571,8 +571,8 @@ private:
               cresult = cres.get_result();
               if (NULL != cresult && OB_SUCC(cresult->next())) {
                 int64_t newer = 0;
-                if (OB_SUCC(cresult->get_int("newer", newer))) {
-                  superseded = (newer > 0);
+                if (OB_SUCC(cresult->get_int("newer", newer)) && newer > 0) {
+                  superseded = true;
                 }
               }
             }
