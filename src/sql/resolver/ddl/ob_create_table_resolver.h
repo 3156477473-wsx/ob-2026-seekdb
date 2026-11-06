@@ -74,6 +74,7 @@ private:
   int append_ai_column_hidden_columns(ParseNode *element,
                                       const ObString &column_name,
                                       const bool is_json_col,
+                                      const bool is_integer_col,
                                       ObIArray<ObColumnSchemaV2> &cols);
   uint64_t gen_udt_set_id();
   int64_t get_primary_key_size() const;

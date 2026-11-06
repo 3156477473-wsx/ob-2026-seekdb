@@ -154,7 +154,8 @@ private:
         const char *sql =
             "select cast(table_id as char) as tid, rowkey_predicate, column_name, "
             "cast(request_id as char) as rid, cast(retry_count as char) as rc "
-            "from oceanbase.__all_ai_column_task where state = 0 and eligible_ts <= now(6) "
+            "from oceanbase.__all_ai_column_task "
+            "where (state = 0 or state = 3) and eligible_ts <= now(6) "
             "order by eligible_ts limit 4";
         if (OB_FAIL(GCTX.sql_proxy_->read(res, sql))) {
         } else if (NULL == (result = res.get_result())) {
@@ -181,7 +182,8 @@ private:
             std::string s_tid(tid.ptr(), tid.length());
             std::string s_rowkey(rowkey.ptr(), rowkey.length());
             std::string s_col(col.ptr(), col.length());
-            int tmp = handle_task(s_tid, s_rowkey, s_col);
+            std::string s_rc(rc.ptr(), rc.length());
+            int tmp = handle_task(s_tid, s_rowkey, s_col, s_rc);
             if (common::OB_SUCCESS != tmp) {
               LOG_INFO("ai column worker handle task failed", K(tmp));
             }
@@ -190,6 +192,34 @@ private:
       }
     }
     return ret;
+  }
+
+  int64_t fetch_max_retries(const std::string &table_id, const std::string &column_name)
+  {
+    int ret = common::OB_SUCCESS;
+    int64_t max_retries = 0;
+    std::string state_col = "__ai_state_" + column_name;
+    common::ObSqlString sql;
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      sqlclient::ObMySQLResult *result = NULL;
+      if (NULL == GCTX.sql_proxy_) {
+      } else if (OB_FAIL(sql.assign_fmt("select comment from oceanbase.__all_column "
+                                        "where table_id = %s and column_name = '%s'",
+                                        table_id.c_str(), sql_escape(state_col).c_str()))) {
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+      } else if (NULL == (result = res.get_result())) {
+      } else if (OB_SUCC(result->next())) {
+        common::ObString cmt;
+        if (OB_SUCC(result->get_varchar("comment", cmt))) {
+          std::string text(cmt.ptr(), cmt.length());
+          size_t pos = text.find("ai:max_retries=");
+          if (std::string::npos != pos) {
+            max_retries = atoll(text.c_str() + pos + 15);
+          }
+        }
+      }
+    }
+    return max_retries;
   }
 
   void drop_task(const std::string &table_id,
@@ -225,7 +255,8 @@ private:
 
   int handle_task(const std::string &table_id,
                   const std::string &rowkey,
-                  const std::string &column_name)
+                  const std::string &column_name,
+                  const std::string &retry_count)
   {
     int ret = common::OB_SUCCESS;
     std::string db_name;
@@ -267,6 +298,7 @@ private:
     }
 
     // request column comment carries "ai:expr=AI_COMPLETE('m', concat('x', content))"
+    bool integer_hint = false;
     if (!table_name.empty()) {
       common::ObSqlString sql;
       std::string req = "__ai_req_" + column_name;
@@ -281,6 +313,7 @@ private:
           common::ObString cmt;
           if (OB_SUCC(result->get_varchar("comment", cmt))) {
             std::string text(cmt.ptr(), cmt.length());
+            integer_hint = (std::string::npos != text.find("base-10 integer"));
             size_t pos = text.find("ai:expr=");
             if (std::string::npos != pos) {
               std::string body = text.substr(pos + 8);
@@ -375,7 +408,11 @@ private:
     if (!url.empty() && !user_text.empty()) {
       CURL *curl = curl_easy_init();
       if (NULL != curl) {
-        std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"Return exactly one valid JSON value when the column type is JSON.\"},{\"role\":\"user\",\"content\":\"" + json_escape(user_text) + "\"}]}";
+        const char *sys_prompt =
+            integer_hint
+                ? "Return exactly one base-10 integer value when the column type is an integer."
+                : "Return exactly one valid JSON value when the column type is JSON.";
+        std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + std::string(sys_prompt) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user_text) + "\"}]}";
         std::string auth = "Authorization: Bearer " + access_key;
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -396,17 +433,24 @@ private:
         curl_easy_cleanup(curl);
         if (CURLE_OK != cc || code >= 400) {
           LOG_INFO("ai column worker request failed", K(cc), K(code));
-          common::ObSqlString upd;
-          if (OB_SUCC(upd.assign_fmt("update oceanbase.__all_ai_column_task set state = 3, "
-                                     "retry_count = retry_count + 1, "
-                                     "eligible_ts = date_add(now(6), interval 1 second) "
-                                     "where table_id = %s and rowkey_predicate = '%s' "
-                                     "and column_name = '%s'",
-                                     table_id.c_str(), sql_escape(rowkey).c_str(),
-                                     column_name.c_str()))) {
-            int64_t affected = 0;
-            int tmp = GCTX.sql_proxy_->write(upd.ptr(), affected);
-            LOG_INFO("ai column worker mark retry", K(tmp), K(affected));
+          const int64_t retried = atoll(retry_count.c_str()) + 1;
+          const int64_t max_retries = fetch_max_retries(table_id, column_name);
+          if (retried > max_retries) {
+            drop_task(table_id, rowkey, column_name);
+          } else {
+            common::ObSqlString upd;
+            if (OB_SUCC(upd.assign_fmt("update oceanbase.__all_ai_column_task set state = 3, "
+                                       "retry_count = retry_count + 1, "
+                                       "eligible_ts = date_add(now(6), interval 1 second) "
+                                       "where table_id = %s and rowkey_predicate = '%s' "
+                                       "and column_name = '%s'",
+                                       table_id.c_str(), sql_escape(rowkey).c_str(),
+                                       column_name.c_str()))) {
+              int64_t affected = 0;
+              int tmp = GCTX.sql_proxy_->write(upd.ptr(), affected);
+              LOG_INFO("ai column worker mark retry", K(tmp), K(affected), K(retried),
+                       K(max_retries));
+            }
           }
           return common::OB_SUCCESS;
         }

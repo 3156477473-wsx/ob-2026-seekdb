@@ -3397,6 +3397,7 @@ static int append_ai_hidden_columns_for_alter(ObAlterTableStmt *stmt,
                                               const ParseNode &column_node,
                                               const ObString &base_name,
                                               const bool is_json_col,
+                                              const bool is_integer_col,
                                               common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -3455,9 +3456,13 @@ static int append_ai_hidden_columns_for_alter(ObAlterTableStmt *stmt,
               hidden.set_charset_type(CHARSET_BINARY);
             }
           } else if (1 == k) {
+            const char *type_hint = is_json_col
+                                        ? " %Return exactly one valid JSON value%"
+                                        : (is_integer_col
+                                               ? " %Return exactly one base-10 integer value%"
+                                               : "");
             int64_t cmt_len = snprintf(cmt_buf, sizeof(cmt_buf), "ai:expr=%.*s%s",
-                                       expr_text.length(), expr_text.ptr(),
-                                       is_json_col ? " %Return exactly one valid JSON value%" : "");
+                                       expr_text.length(), expr_text.ptr(), type_hint);
             if (cmt_len <= 0 || cmt_len >= static_cast<int64_t>(sizeof(cmt_buf))) {
               ret = OB_ERR_UNEXPECTED;
             } else if (OB_FAIL(ob_write_string(allocator, ObString(cmt_len, cmt_buf), hidden_cmt))) {
@@ -3560,11 +3565,12 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
-          } else if (OB_FAIL(append_ai_hidden_columns_for_alter(alter_table_stmt,
-                                                               *node.children_[i],
-                                                               alter_column_schema.get_column_name_str(),
-                                                               ObJsonType == alter_column_schema.get_data_type(),
-                                                               *allocator_))) {
+          } else if (OB_FAIL(append_ai_hidden_columns_for_alter(
+                         alter_table_stmt, *node.children_[i],
+                         alter_column_schema.get_column_name_str(),
+                         ObJsonType == alter_column_schema.get_data_type(),
+                         ob_is_integer_type(alter_column_schema.get_data_type()),
+                         *allocator_))) {
           }
         }
       }

@@ -169,6 +169,7 @@ int ObCreateTableResolver::append_ai_column_hidden_columns(
     ParseNode *element,
     const ObString &column_name,
     const bool is_json_col,
+    const bool is_integer_col,
     ObIArray<ObColumnSchemaV2> &cols)
 {
   int ret = OB_SUCCESS;
@@ -236,6 +237,8 @@ int ObCreateTableResolver::append_ai_column_hidden_columns(
       } else if (OB_FAIL(req_cmt.append("ai:expr="))) {
       } else if (OB_FAIL(req_cmt.append(expr_text))) {
       } else if (is_json_col && OB_FAIL(req_cmt.append(" %Return exactly one valid JSON value%"))) {
+      } else if (is_integer_col
+                 && OB_FAIL(req_cmt.append(" %Return exactly one base-10 integer value%"))) {
       } else {
         const char *prefixes[3] = {"__ai_state_", "__ai_req_", "__ai_spec_"};
         ObString comments[3];
@@ -1164,8 +1167,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           }
           ++col_index;
           if (OB_FAIL(ret)) {
-          } else if (OB_FAIL(append_ai_column_hidden_columns(ai_element, ai_col_name,
-                                                             ai_col_is_json, resolved_cols))) {
+          } else if (OB_FAIL(append_ai_column_hidden_columns(
+                       ai_element, ai_col_name, ai_col_is_json,
+                       ob_is_integer_type(ai_col.get_data_type()), resolved_cols))) {
             SQL_RESV_LOG(WARN, "failed to append ai column hidden columns", K(ret));
           }
         }
