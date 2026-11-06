@@ -249,18 +249,232 @@ private:
     return ret;
   }
 
+
+  static bool expr_mentions_ident(const ObString &expr, const ObString &name)
+  {
+    bool found = false;
+    if (expr.length() > 0 && name.length() > 0) {
+      const char *base = expr.ptr();
+      const int64_t total = expr.length();
+      const int64_t len = name.length();
+      for (int64_t i = 0; !found && i + len <= total; ++i) {
+        if (0 != strncasecmp(base + i, name.ptr(), static_cast<size_t>(len))) {
+          continue;
+        }
+        const bool left_ok = (0 == i) || !is_ident_char(base[i - 1]);
+        const bool right_ok = (i + len >= total) || !is_ident_char(base[i + len]);
+        found = left_ok && right_ok;
+      }
+    }
+    return found;
+  }
+
+  static bool is_ident_char(const char c)
+  {
+    return ('_' == c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9');
+  }
+
+  static bool dependency_assigned(const ObTableSchema &table_schema,
+                                  const ObIArray<ObString> &assigned_names,
+                                  const ObString &expr)
+  {
+    bool assigned = false;
+    for (int64_t i = 0; !assigned && i < assigned_names.count(); ++i) {
+      const ObString &name = assigned_names.at(i);
+      if (name.empty()) {
+        continue;
+      }
+      assigned = expr_mentions_ident(expr, name);
+      if (!assigned) {
+        const ObColumnSchemaV2 *col = table_schema.get_column_schema(name);
+        assigned = NULL != col && col->is_rowkey_column();
+      }
+    }
+    return assigned;
+  }
+
+
+  static bool dependency_changed(const ObTableSchema &table_schema,
+                                 const ObIArray<uint64_t> &column_ids,
+                                 const ObChunkDatumStore::StoredRow &new_row,
+                                 const ObChunkDatumStore::StoredRow *old_row,
+                                 const ObString &expr)
+  {
+    bool changed = false;
+    if (NULL == old_row) {
+      changed = true;
+    } else {
+      const ObDatum *new_cells = new_row.cells();
+      const ObDatum *old_cells = old_row->cells();
+      for (int64_t i = 0; !changed && i < column_ids.count(); ++i) {
+        const ObColumnSchemaV2 *col = table_schema.get_column_schema(column_ids.at(i));
+        if (NULL == col || col->is_hidden()) {
+          continue;
+        }
+        if (!expr_mentions_ident(expr, col->get_column_name_str())) {
+          continue;
+        }
+        if (i >= new_row.cnt_ || i >= old_row->cnt_ || NULL == new_cells || NULL == old_cells) {
+          continue;
+        }
+        if (!common::ObDatum::binary_equal(new_cells[i], old_cells[i])) {
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+
+  static bool update_dependency_changed(const ObTableSchema &table_schema,
+                                        const ObIArray<ObString> &assigned_names,
+                                        const ObColumnSchemaV2 &req_column)
+  {
+    bool changed = true;
+    ObString expr;
+    const ObString cmt = req_column.get_comment_str();
+    const char *mark = "ai:expr=";
+    const int64_t mark_len = 8;
+    if (cmt.length() > mark_len) {
+      for (int64_t i = 0; i + mark_len <= cmt.length(); ++i) {
+        if (0 == strncmp(cmt.ptr() + i, mark, mark_len)) {
+          expr.assign_ptr(cmt.ptr() + i + mark_len, static_cast<int32_t>(cmt.length() - i - mark_len));
+          break;
+        }
+      }
+    }
+    if (expr.length() > 0) {
+      changed = dependency_assigned(table_schema, assigned_names, expr);
+    }
+    return changed;
+  }
+
 public:
+  static int remove_tasks_for_deleted_row(ObExecContext &exec_ctx,
+                                          const uint64_t table_id,
+                                          const ObIArray<uint64_t> &column_ids,
+                                          const ObChunkDatumStore::StoredRow &row)
+  {
+    int ret = OB_SUCCESS;
+    uint64_t user_table_id = table_id;
+    ObSQLSessionInfo *session = exec_ctx.get_my_session();
+    transaction::ObTxDesc *tx_desc = NULL;
+    storage::ObAccessService *access_service = NULL;
+    transaction::ObTransService *txs = NULL;
+    share::schema::ObSchemaGetterGuard guard;
+    const ObTableSchema *table_schema = NULL;
+    const ObTableSchema *task_schema = NULL;
+    ObArenaAllocator allocator("aiTaskDel");
+    ObTxReadSnapshot snapshot;
+    if (OB_ISNULL(session) || OB_ISNULL(access_service = share::server_service<storage::ObAccessService>())
+        || OB_ISNULL(txs = share::server_service<transaction::ObTransService>())) {
+      ret = OB_SUCCESS;
+    } else if (OB_ISNULL(tx_desc = session->get_tx_desc())) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(share::schema::ObMultiVersionSchemaService::get_instance()
+                         .get_runtime_schema_guard(guard))) {
+      LOG_INFO("ai task delete guard failed", K(ret));
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))
+               || OB_ISNULL(table_schema)) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(canonical_table_id(guard, *table_schema, user_table_id))) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(guard.get_table_schema(user_table_id, table_schema))
+               || OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(find_task_schema(guard, task_schema)) || OB_ISNULL(task_schema)) {
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(txs->get_read_snapshot(*tx_desc, transaction::ObTxIsolationLevel::RC,
+                                              THIS_WORKER.get_timeout_ts(), snapshot))) {
+      LOG_INFO("ai task delete snapshot failed", K(ret));
+      ret = OB_SUCCESS;
+    } else {
+      ObString predicate;
+      ObSEArray<uint64_t, 16> all_ids;
+      const ObIArray<uint64_t> *pred_ids = &column_ids;
+      if (OB_FAIL(table_schema->get_all_column_ids(all_ids))) {
+        pred_ids = &column_ids;
+      } else if (row.cnt_ == all_ids.count()) {
+        pred_ids = &all_ids;
+      }
+      LOG_INFO("ai task delete row shape", "row", row.cnt_, "cols", column_ids.count(),
+               "all", all_ids.count());
+      if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, *pred_ids, row, predicate))) {
+        LOG_INFO("ai task delete predicate failed", K(ret));
+        ret = OB_SUCCESS;
+      } else {
+        for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+             OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+          const ObColumnSchemaV2 *column = *iter;
+          if (NULL == column || !column->is_hidden() || !is_ai_request_column(column->get_column_name_str())) {
+            continue;
+          }
+          ObSEArray<uint64_t, 4> key_ids;
+          ObDatum key_datums[3];
+          blocksstable::ObDatumRow key_row;
+          ObTableDMLParam table_param(allocator);
+          ObDMLBaseParam dml_param;
+          ObStoreCtxGuard guard_ctx;
+          ObValueRowIterator row_iter;
+          int64_t affected = 0;
+          key_datums[0].set_uint(table_schema->get_table_id());
+          key_datums[1].set_uint(column->get_column_id());
+          key_datums[2].set_string(predicate);
+          const ObColumnSchemaV2 *c_table = task_schema->get_column_schema(ObString::make_string("table_id"));
+          const ObColumnSchemaV2 *c_column = task_schema->get_column_schema(ObString::make_string("column_id"));
+          const ObColumnSchemaV2 *c_pred = task_schema->get_column_schema(ObString::make_string("rowkey_predicate"));
+          if (OB_ISNULL(c_table) || OB_ISNULL(c_column) || OB_ISNULL(c_pred)) {
+            ret = OB_SUCCESS;
+          } else if (OB_FAIL(key_ids.push_back(c_table->get_column_id()))) {
+          } else if (OB_FAIL(key_ids.push_back(c_column->get_column_id()))) {
+          } else if (OB_FAIL(key_ids.push_back(c_pred->get_column_id()))) {
+          } else if (OB_FAIL(key_row.init(key_ids.count()))) {
+          } else if (FALSE_IT(MEMCPY(key_row.storage_datums_, key_datums, sizeof(key_datums)))) {
+          } else if (OB_FAIL(table_param.convert(task_schema, task_schema->get_schema_version(), key_ids))) {
+          } else if (FALSE_IT(dml_param.sql_mode_ = session->get_sql_mode())) {
+          } else if (FALSE_IT(dml_param.table_param_ = &table_param)) {
+          } else if (FALSE_IT(dml_param.timeout_ = THIS_WORKER.get_timeout_ts())) {
+          } else if (FALSE_IT(dml_param.snapshot_.assign(snapshot))) {
+          } else if (FALSE_IT(dml_param.schema_version_ = task_schema->get_schema_version())) {
+          } else if (FALSE_IT(dml_param.dml_allocator_ = &allocator)) {
+          } else if (OB_FAIL(access_service->get_write_store_ctx_guard(
+                       THIS_WORKER.get_timeout_ts(), *tx_desc, snapshot, 0,
+                       dml_param.write_flag_, guard_ctx))) {
+            LOG_INFO("ai task delete guard ctx failed", K(ret));
+            ret = OB_SUCCESS;
+          } else if (FALSE_IT(dml_param.store_ctx_guard_ = &guard_ctx)) {
+          } else if (OB_FAIL(row_iter.init())) {
+          } else if (OB_FAIL(row_iter.add_row(key_row))) {
+          } else if (OB_FAIL(access_service->delete_rows(task_schema->get_tablet_id(), *tx_desc,
+                                                         dml_param, key_ids, &row_iter, affected))) {
+            LOG_INFO("ai task delete rows failed", K(ret), K(affected));
+            ret = OB_SUCCESS;
+          } else {
+            LOG_INFO("ai task rows removed", K(affected));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // keep DML path unaffected
+    }
+    return OB_SUCCESS;
+  }
+
   static int write_tasks_for_update(ObExecContext &exec_ctx,
                                     const uint64_t table_id,
                                     const ObIArray<uint64_t> &column_ids,
-                                    const ObChunkDatumStore::StoredRow *row)
+                                    const ObChunkDatumStore::StoredRow *row,
+                                    const ObIArray<ObString> &assigned_names)
   {
     int ret = common::OB_SUCCESS;
     if (OB_ISNULL(row)) {
       LOG_INFO("ai column task writer skip update: row is null", K(table_id));
     } else {
-      LOG_INFO("ai column task writer update probe", K(table_id), "cells_cnt", row->cnt_);
-      ret = write_tasks_for_insert_impl(exec_ctx, table_id, column_ids, *row, true);
+      ret = write_tasks_for_insert_impl(exec_ctx, table_id, column_ids, *row,
+                                        true, &assigned_names);
     }
     return ret;
   }
@@ -269,9 +483,9 @@ public:
                                          const uint64_t table_id,
                                          const ObIArray<uint64_t> &column_ids,
                                          const ObChunkDatumStore::StoredRow &row,
-                                          const bool filter_by_update = false)
+                                         const bool filter_by_update = false,
+                                         const ObIArray<ObString> *assigned_names = NULL)
   {
-    UNUSED(filter_by_update);
     int ret = OB_SUCCESS;
     uint64_t user_table_id = OB_INVALID_ID;
     ObSQLSessionInfo *session = exec_ctx.get_my_session();
@@ -314,6 +528,11 @@ public:
           if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, column_ids, row, predicate))) {
             LOG_INFO("ai task predicate failed", K(ret), K(table_id),
                      "column_id", column->get_column_id());
+          } else if (filter_by_update
+                     && (NULL == assigned_names
+                         || !update_dependency_changed(*table_schema, *assigned_names,
+                                                       *column))) {
+            // the columns referenced by this AI expression were not modified
           } else if (OB_FAIL(write_one_row(user_table_id, *task_schema, *column, predicate,
                                            *tx_desc, *access_service))) {
             LOG_INFO("ai task write one row failed", K(ret), K(table_id),

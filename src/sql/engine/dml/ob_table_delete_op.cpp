@@ -18,6 +18,7 @@
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_table_delete_op.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "sql/engine/dml/ob_ai_column_task_writer.h"
 
 namespace oceanbase
 {
@@ -227,7 +228,18 @@ int ObTableDeleteOp::write_row_to_das_buffer()
   return ret;
 }
 
-OB_INLINE int ObTableDeleteOp::delete_row_to_das()
+OB_INLINE uint64_t ObTableDeleteOp::ai_column_table_id()
+{
+  uint64_t table_id = common::OB_INVALID_ID;
+  ObTableDeleteOpInput *input = static_cast<ObTableDeleteOpInput *>(get_input());
+  ObDASTableLoc *loc = (NULL != input) ? input->get_table_loc() : NULL;
+  if (NULL != loc && NULL != loc->loc_meta_) {
+    table_id = loc->loc_meta_->ref_table_id_;
+  }
+  return table_id;
+}
+
+int ObTableDeleteOp::delete_row_to_das()
 {
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.del_ctdefs_.count(); ++i) {
@@ -248,6 +260,10 @@ OB_INLINE int ObTableDeleteOp::delete_row_to_das()
         break;
       } else if (OB_FAIL(calc_tablet_loc(del_ctdef, del_rtdef, tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::delete_row(del_ctdef, del_rtdef, tablet_loc, dml_rtctx_, modify_row.old_row_))) {
+      } else if (OB_FAIL(ObAIColumnTaskWriter::remove_tasks_for_deleted_row(
+                        ctx_, ai_column_table_id(), del_ctdef.column_ids_, *modify_row.old_row_))) {
+        LOG_INFO("remove ai column tasks for delete failed", K(ret));
+        ret = OB_SUCCESS;
       } else if (need_after_row_process(del_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       } else {
         ++del_rtdef.cur_row_num_;

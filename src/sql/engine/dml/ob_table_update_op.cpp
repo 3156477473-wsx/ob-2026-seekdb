@@ -309,6 +309,25 @@ OB_INLINE int ObTableUpdateOp::calc_tablet_loc(const ObUpdCtDef &upd_ctdef,
   return ret;
 }
 
+int ObTableUpdateOp::build_ai_assigned_names(const ObUpdCtDef &upd_ctdef,
+                                             ObIArray<ObString> &names)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < upd_ctdef.assign_columns_.count(); ++i) {
+    const ColumnContent &content = upd_ctdef.assign_columns_.at(i);
+    if (OB_FAIL(names.push_back(content.column_name_))) {
+      LOG_INFO("push assigned column name failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && names.empty()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < upd_ctdef.column_ids_.count(); ++i) {
+      if (OB_FAIL(names.push_back(ObString()))) {
+      }
+    }
+  }
+  return ret;
+}
+
 OB_INLINE 
 uint64_t ObTableUpdateOp::ai_column_table_id()
 {
@@ -335,6 +354,7 @@ int ObTableUpdateOp::update_row_to_das()
       ObDASTabletLoc *new_tablet_loc = nullptr;
       ObDMLModifyRowNode modify_row(this, &upd_ctdef, &upd_rtdef, ObDmlEventType::DE_UPDATING);
       bool is_skipped = false;
+      ObSEArray<ObString, 16> ai_assigned_names;
       ++upd_rtdef.cur_row_num_;
       if (OB_FAIL(ObDMLService::process_update_row(upd_ctdef, upd_rtdef, is_skipped, *this))) {
       } else if (OB_UNLIKELY(is_skipped)) {
@@ -344,11 +364,15 @@ int ObTableUpdateOp::update_row_to_das()
       } else if (OB_FAIL(calc_tablet_loc(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::update_row(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc, dml_rtctx_,
                                                  modify_row.old_row_, modify_row.new_row_, modify_row.full_row_))) {
+      } else if (OB_FAIL(build_ai_assigned_names(upd_ctdef, ai_assigned_names))) {
+        LOG_INFO("build ai assigned names failed", K(ret));
+        ret = OB_SUCCESS;
       } else if (OB_FAIL(ObAIColumnTaskWriter::write_tasks_for_update(
                         ctx_, ai_column_table_id(), upd_ctdef.column_ids_,
                         nullptr == modify_row.new_row_
                             ? (nullptr == modify_row.full_row_ ? modify_row.old_row_ : modify_row.full_row_)
-                            : modify_row.new_row_))) {
+                            : modify_row.new_row_,
+                        ai_assigned_names))) {
         LOG_INFO("write ai column tasks for update failed", K(ret));
         ret = OB_SUCCESS;
       } else if (need_after_row_process(upd_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
