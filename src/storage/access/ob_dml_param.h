@@ -106,6 +106,10 @@ struct ObDMLBaseParam
   // write flag for inner write processing
   concurrent_control::ObWriteFlag write_flag_;
   bool check_schema_version_;
+  // Internal maintenance DML (for example catalog tasks written by the AI column
+  // workers) may delete a row without the original row image; those writers set
+  // this flag so the storage layer skips the defensive old-row comparison.
+  bool skip_old_row_check_;
   int64_t ddl_task_id_;
   mutable ObArenaAllocator lob_allocator_;
   bool is_main_table_in_fts_ddl_; // whether the main table is in fts ddl when dml is executed

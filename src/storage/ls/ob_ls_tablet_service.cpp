@@ -2449,7 +2449,7 @@ int ObLSTabletService::delete_rows(
                             dml_param,
                             ctx.mvcc_acc_ctx_.mem_ctx_->get_query_allocator(),
                             ObDmlFlag::DF_DELETE,
-                            true /* is_need_check_old_row_ */) {
+                            !dml_param.skip_old_row_check_) {
     int64_t row_count = 0;
     ObDatumRow *rows = nullptr;
     ObDatumRow *tmp_rows = nullptr;
