@@ -489,7 +489,19 @@ bool ai_expr_mentions(const common::ObString &expr, const common::ObString &name
     const char *base = expr.ptr();
     const int64_t total = expr.length();
     const int64_t len = name.length();
+    bool in_quote = false;
     for (int64_t i = 0; !found && i + len <= total; ++i) {
+      if ('\'' == base[i]) {
+        if (in_quote && i + 1 < total && '\'' == base[i + 1]) {
+          ++i;
+          continue;
+        }
+        in_quote = !in_quote;
+        continue;
+      }
+      if (in_quote) {
+        continue;
+      }
       if (0 != strncasecmp(base + i, name.ptr(), static_cast<size_t>(len))) {
         continue;
       }
@@ -687,6 +699,17 @@ int ObDelUpdResolver::build_ai_column_assignments(ObTableAssignment &table_assig
     const ObString base_name(hname.length() - 9, hname.ptr() + 9);
     const ObColumnSchemaV2 *ai_col = table_schema.get_column_schema(base_name);
     if (NULL == ai_col || ai_col->is_hidden()) {
+      continue;
+    }
+    bool self_assigned = false;
+    for (int64_t k = 0; !self_assigned && k < table_assign.assignments_.count(); ++k) {
+      const ObAssignment &a = table_assign.assignments_.at(k);
+      if (NULL != a.column_expr_
+          && a.column_expr_->get_column_id() == ai_col->get_column_id()) {
+        self_assigned = true;
+      }
+    }
+    if (self_assigned) {
       continue;
     }
     bool depends = false;

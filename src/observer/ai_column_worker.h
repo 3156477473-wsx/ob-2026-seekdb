@@ -299,6 +299,7 @@ private:
 
     // request column comment carries "ai:expr=AI_COMPLETE('m', concat('x', content))"
     bool integer_hint = false;
+    bool json_hint = false;
     if (!table_name.empty()) {
       common::ObSqlString sql;
       std::string req = "__ai_req_" + column_name;
@@ -314,6 +315,7 @@ private:
           if (OB_SUCC(result->get_varchar("comment", cmt))) {
             std::string text(cmt.ptr(), cmt.length());
             integer_hint = (std::string::npos != text.find("base-10 integer"));
+            json_hint = (std::string::npos != text.find("valid JSON value"));
             size_t pos = text.find("ai:expr=");
             if (std::string::npos != pos) {
               std::string body = text.substr(pos + 8);
@@ -411,7 +413,8 @@ private:
         const char *sys_prompt =
             integer_hint
                 ? "Return exactly one base-10 integer value when the column type is an integer."
-                : "Return exactly one valid JSON value when the column type is JSON.";
+                : (json_hint ? "Return exactly one valid JSON value when the column type is JSON."
+                             : "Answer with one short plain-text line.");
         std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + std::string(sys_prompt) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user_text) + "\"}]}";
         std::string auth = "Authorization: Bearer " + access_key;
         struct curl_slist *headers = NULL;
