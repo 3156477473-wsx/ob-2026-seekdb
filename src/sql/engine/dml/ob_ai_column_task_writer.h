@@ -368,7 +368,7 @@ public:
     const ObTableSchema *task_schema = NULL;
     ObArenaAllocator allocator("aiTaskDel");
     ObTxReadSnapshot snapshot;
-    LOG_INFO("ai task delete enter", K(table_id), "cols", column_ids.count(), "row", row.cnt_);
+    
     if (OB_ISNULL(session) || OB_ISNULL(access_service = share::server_service<storage::ObAccessService>())
         || OB_ISNULL(txs = share::server_service<transaction::ObTransService>())) {
       ret = OB_SUCCESS;
@@ -401,21 +401,19 @@ public:
       } else if (row.cnt_ == all_ids.count()) {
         pred_ids = &all_ids;
       }
-      LOG_INFO("ai task delete row shape", "row", row.cnt_, "cols", column_ids.count(),
-               "all", all_ids.count());
+      
       if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, *pred_ids, row, predicate))) {
         LOG_INFO("ai task delete predicate failed", K(ret));
         ret = OB_SUCCESS;
       } else {
-        LOG_INFO("ai task delete predicate built", K(predicate));
+        
         for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
              OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
           const ObColumnSchemaV2 *column = *iter;
           if (NULL == column || !column->is_hidden() || !is_ai_request_column(column->get_column_name_str())) {
             continue;
           }
-          LOG_INFO("ai task delete column", "name", column->get_column_name_str(),
-                   "cid", column->get_column_id(), K(predicate));
+          
           ObSEArray<uint64_t, 4> key_ids;
           ObDatum key_datums[3];
           blocksstable::ObDatumRow key_row;
@@ -430,9 +428,7 @@ public:
           const ObColumnSchemaV2 *c_table = task_schema->get_column_schema(ObString::make_string("table_id"));
           const ObColumnSchemaV2 *c_column = task_schema->get_column_schema(ObString::make_string("column_id"));
           const ObColumnSchemaV2 *c_pred = task_schema->get_column_schema(ObString::make_string("rowkey_predicate"));
-          LOG_INFO("ai task delete task cols", "c_table", OB_NOT_NULL(c_table), "c_column",
-                   OB_NOT_NULL(c_column), "c_pred", OB_NOT_NULL(c_pred),
-                   "task_table", task_schema->get_table_name_str());
+          
           if (OB_ISNULL(c_table) || OB_ISNULL(c_column) || OB_ISNULL(c_pred)) {
             ret = OB_SUCCESS;
           } else if (OB_FAIL(key_ids.push_back(c_table->get_column_id()))) {
