@@ -128,6 +128,7 @@ private:
   static int write_one_row(const uint64_t table_id,
                            const ObTableSchema &table_schema,
                            const ObColumnSchemaV2 &ai_column,
+                           const int64_t request_id,
                            const ObString &predicate,
                            transaction::ObTxDesc &tx_desc,
                            storage::ObAccessService &access_service)
@@ -196,7 +197,7 @@ private:
             } else if (0 == column->get_column_name_str().case_compare("rowkey_predicate")) {
               datum.set_string(predicate);
             } else if (0 == column->get_column_name_str().case_compare("request_id")) {
-              datum.set_int(ObTimeUtility::current_time());
+              datum.set_int(request_id);
             } else if (0 == column->get_column_name_str().case_compare("state")) {
               datum.set_int(0);
             } else if (0 == column->get_column_name_str().case_compare("retry_count")) {
@@ -517,6 +518,7 @@ public:
                "schema_table_id", table_schema->get_table_id(),
                "has_partition", table_schema->has_partition(),
                "schema_version", table_schema->get_schema_version());
+      const int64_t row_request_id = ObTimeUtility::current_time();
       for (int64_t i = 0; OB_SUCC(ret) && i < table_schema->get_column_count(); ++i) {
         const ObColumnSchemaV2 *column = table_schema->get_column_schema_by_idx(i);
         if (OB_ISNULL(column)) {
@@ -533,8 +535,8 @@ public:
                          || !update_dependency_changed(*table_schema, *assigned_names,
                                                        *column))) {
             // the columns referenced by this AI expression were not modified
-          } else if (OB_FAIL(write_one_row(user_table_id, *task_schema, *column, predicate,
-                                           *tx_desc, *access_service))) {
+          } else if (OB_FAIL(write_one_row(user_table_id, *task_schema, *column, row_request_id,
+                                           predicate, *tx_desc, *access_service))) {
             LOG_INFO("ai task write one row failed", K(ret), K(table_id),
                      "column_id", column->get_column_id());
           }
