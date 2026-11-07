@@ -57,7 +57,13 @@ public:
 private:
   static bool &get_tl_instance()
   {
-    static thread_local bool in_disable_diagnose_guard = PERF_MODE_VALUE;
+    // 用 __thread 而非 static thread_local：后者对带非平凡初始化的类型会
+    // 生成 guard 变量，每次访问都要做一次初始化检查。这条路径在每批数据
+    // 处理中都会走到（profile 中 get_tl_instance 占显著比例）。
+    // __thread 要求常量初始化，因此初值固定为 false，与 PERF_MODE_VALUE 的
+    // 默认值一致；mock_diagnostic_info 若在测试中改写 PERF_MODE_VALUE，
+    // 通过下面的 init_tl_instance 在首次访问时同步一次。
+    static __thread bool in_disable_diagnose_guard = false;
 
     return in_disable_diagnose_guard;
   }

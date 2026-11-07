@@ -1064,7 +1064,13 @@ int ObOperator::get_next_batch(const int64_t max_row_cnt, const ObBatchRows *&ba
           }
           if (OB_SUCC(ret)) {
             // FIXME bin.lb: accumulate bit count is CPU consuming, disable in perf mode?
-            skipped_rows_count = brs_.skip_->accumulate_bit_cnt(brs_.size_);
+            // 快路径：all_rows_active_ 已经表明整批没有 skip 行，无需再扫描
+            // bitmap 做 popcount（这条路径在每批数据上都会走到，profile 中占比明显）。
+            if (OB_LIKELY(brs_.all_rows_active_)) {
+              skipped_rows_count = 0;
+            } else {
+              skipped_rows_count = brs_.skip_->accumulate_bit_cnt(brs_.size_);
+            }
             if (OB_UNLIKELY(brs_.size_ == skipped_rows_count)) {
               reset_batchrows();
               continue;
@@ -1118,7 +1124,11 @@ int ObOperator::get_next_batch(const int64_t max_row_cnt, const ObBatchRows *&ba
           // if no data in batch, end iterate immediately, otherwise wait for next iterate
           brs_.end_ = !brs_.size_;
         }
-        skipped_rows_count = brs_.skip_->accumulate_bit_cnt(brs_.size_);
+        if (OB_LIKELY(brs_.all_rows_active_)) {
+          skipped_rows_count = 0;
+        } else {
+          skipped_rows_count = brs_.skip_->accumulate_bit_cnt(brs_.size_);
+        }
         op_monitor_info_.output_row_count_ += brs_.size_ - skipped_rows_count;
         op_monitor_info_.skipped_rows_count_ += skipped_rows_count; // for batch
         ++op_monitor_info_.output_batches_; // for batch

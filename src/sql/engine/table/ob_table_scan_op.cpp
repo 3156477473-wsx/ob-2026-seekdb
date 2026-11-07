@@ -2097,7 +2097,9 @@ int ObTableScanOp::get_next_batch_with_das(int64_t &count, int64_t capacity)
           //Do nothing.
           brs_.skip_->reset(count);
         } else {
-          int64_t skipped_rows_count = brs_.skip_->accumulate_bit_cnt(count);
+          // all_rows_active_ 表明整批无 skip 行，省掉一次 bitmap popcount
+          int64_t skipped_rows_count = brs_.all_rows_active_
+                                       ? 0 : brs_.skip_->accumulate_bit_cnt(count);
           got_batch = true;
           output_row_cnt_ += (count - skipped_rows_count);
           input_row_cnt_ += (count - skipped_rows_count);
