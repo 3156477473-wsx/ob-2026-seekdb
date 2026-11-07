@@ -654,7 +654,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
       }
     }
     if (OB_SUCC(ret) && T_UPDATE_SCOPE == scope) {
-      if (OB_FAIL(build_ai_column_assignments(assigns.at(i), table_item, *table_schema,
+      if (OB_FAIL(build_ai_column_assignments(assigns, i, table_item, *table_schema,
                                               *schema_guard))) {
       }
     }
@@ -662,14 +662,15 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
   return ret;
 }
 
-int ObDelUpdResolver::build_ai_column_assignments(ObTableAssignment &table_assign,
+int ObDelUpdResolver::build_ai_column_assignments(ObIArray<ObTableAssignment> &table_assigns,
+                                                  const int64_t assign_idx,
                                                   const TableItem *table_item,
                                                   const ObTableSchema &table_schema,
                                                   ObSchemaGetterGuard &schema_guard)
 {
   int ret = OB_SUCCESS;
   ObDMLStmt *stmt = get_stmt();
-  UNUSED(schema_guard);
+  ObTableAssignment &table_assign = table_assigns.at(assign_idx);
   if (OB_ISNULL(stmt) || OB_ISNULL(table_item) || OB_ISNULL(params_.expr_factory_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid context for ai column assignments", K(ret));
@@ -757,6 +758,95 @@ int ObDelUpdResolver::build_ai_column_assignments(ObTableAssignment &table_assig
         LOG_INFO("push ai null assignment failed", K(ret));
       } else {
         LOG_INFO("ai null assignment added", K(table_item->table_id_), K(ai_col->get_column_id()));
+        if (OB_FAIL(cascade_ai_generated_assignments(table_assigns, assign_idx, table_item,
+                                                     table_schema, schema_guard, *ai_col))) {
+          LOG_INFO("cascade ai generated assignments failed", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDelUpdResolver::cascade_ai_generated_assignments(ObIArray<ObTableAssignment> &table_assigns,
+                                                       const int64_t assign_idx,
+                                                       const TableItem *table_item,
+                                                       const ObTableSchema &table_schema,
+                                                       ObSchemaGetterGuard &schema_guard,
+                                                       const ObColumnSchemaV2 &ai_col)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  ObTableAssignment &table_assign = table_assigns.at(assign_idx);
+  bool has_vec_index = false;
+  ObIndexType index_type = INDEX_TYPE_MAX;
+  if (OB_ISNULL(stmt) || OB_ISNULL(table_item) || OB_ISNULL(params_.expr_factory_)
+      || OB_ISNULL(params_.allocator_)) {
+    ret = OB_NOT_INIT;
+    LOG_INFO("invalid context for ai generated assignments", K(ret));
+  } else if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(table_schema, schema_guard,
+             ai_col.get_column_id(), has_vec_index, index_type))) {
+    LOG_INFO("check ai column vector index failed", K(ret));
+  }
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && iter != table_schema.column_end(); ++iter) {
+    const ObColumnSchemaV2 *gen = *iter;
+    bool need_assign = false;
+    if (NULL == gen || gen->get_column_id() == ai_col.get_column_id()) {
+      continue;
+    } else if (gen->is_vec_hnsw_vid_column() || gen->is_vec_ivf_center_id_column()) {
+      need_assign = has_vec_index;
+    } else if (gen->is_generated_column()) {
+      ObSEArray<uint64_t, 8> cascaded;
+      if (OB_FAIL(gen->get_cascaded_column_ids(cascaded))) {
+        LOG_INFO("get cascaded column ids failed", K(ret));
+      } else {
+        need_assign = has_exist_in_array(cascaded, ai_col.get_column_id());
+      }
+    }
+    bool assigned = false;
+    for (int64_t k = 0; OB_SUCC(ret) && !assigned && k < table_assign.assignments_.count(); ++k) {
+      const ObAssignment &a = table_assign.assignments_.at(k);
+      assigned = (NULL != a.column_expr_ && a.column_expr_->get_column_id() == gen->get_column_id());
+    }
+    if (OB_FAIL(ret) || !need_assign || assigned) {
+      continue;
+    }
+    ColumnItem *col_item = NULL;
+    ObSEArray<ObColumnRefRawExpr *, 1> col_exprs;
+    ObAssignment assignment;
+    if (OB_FAIL(add_column_to_stmt(*table_item, *gen, col_exprs))) {
+      LOG_INFO("add ai generated column to stmt failed", K(ret), K(gen->get_column_id()));
+    } else if (OB_ISNULL(col_item = stmt->get_column_item_by_id(table_item->table_id_,
+                                                                gen->get_column_id()))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_INFO("ai generated column item missing", K(gen->get_column_id()));
+    } else {
+      assignment.column_expr_ = col_item->expr_;
+      assignment.is_implicit_ = true;
+      if (gen->is_generated_column()) {
+        if (OB_ISNULL(col_item->expr_->get_dependant_expr())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
+                                            col_item->expr_->get_dependant_expr(),
+                                            assignment.expr_))) {
+          LOG_INFO("copy ai generated expr failed", K(ret));
+        }
+      } else {
+        assignment.expr_ = col_item->expr_;
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(ObRawExprUtils::build_column_conv_expr(*params_.expr_factory_,
+                                                                *params_.allocator_,
+                                                                *col_item->get_expr(),
+                                                                assignment.expr_,
+                                                                session_info_))) {
+        LOG_INFO("build ai generated conv expr failed", K(ret));
+      } else if (OB_FAIL(add_assignment(table_assigns, table_item, col_item, assignment))) {
+        LOG_INFO("add ai generated assignment failed", K(ret), K(gen->get_column_id()));
+      } else {
+        LOG_INFO("ai generated assignment added", K(table_item->table_id_),
+                 K(gen->get_column_id()));
       }
     }
   }
