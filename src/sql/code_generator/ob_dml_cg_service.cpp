@@ -206,6 +206,36 @@ int ObDmlCgService::generate_delete_ctdef(ObLogDelUpd &op,
     } else if (OB_FAIL(cg_.generate_rt_exprs(distinct_exprs, del_ctdef.distinct_key_))) {
     }
   }
+  // A table that carries ai columns removes the pending ai tasks of every
+  // deleted row through an inner sql statement, so the plan has to open the
+  // inner connection (same as a foreign key cascade does).
+  if (OB_SUCC(ret) && index_dml_info.is_primary_index_) {
+    ObSchemaGetterGuard *schema_guard = NULL;
+    const ObTableSchema *table_schema = NULL;
+    ObLogPlan *log_plan = op.get_plan();
+    bool has_ai_column = false;
+    if (OB_ISNULL(log_plan)
+        || OB_ISNULL(schema_guard = log_plan->get_optimizer_context().get_schema_guard())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(schema_guard->get_table_schema(index_dml_info.ref_table_id_, table_schema))) {
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+           OB_SUCC(ret) && !has_ai_column && iter != table_schema->column_end();
+           ++iter) {
+        const ObColumnSchemaV2 *column = *iter;
+        if (NULL != column && column->is_hidden()
+            && column->get_column_name_str().length() > 9
+            && 0 == strncmp(column->get_column_name_str().ptr(), "__ai_req_", 9)) {
+          has_ai_column = true;
+        }
+      }
+      if (OB_SUCC(ret) && has_ai_column) {
+        cg_.phy_plan_->set_has_nested_sql(true);
+      }
+    }
+  }
   return ret;
 }
 

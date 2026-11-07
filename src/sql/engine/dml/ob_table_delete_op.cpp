@@ -228,6 +228,34 @@ int ObTableDeleteOp::write_row_to_das_buffer()
   return ret;
 }
 
+int ObTableDeleteOp::remove_ai_column_tasks(const ObDelCtDef &del_ctdef,
+                                            const ObChunkDatumStore::StoredRow &row)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("aiTaskDel");
+  ObString sql;
+  if (OB_FAIL(ObAIColumnTaskWriter::build_delete_task_sql(
+                allocator, ai_column_table_id(), del_ctdef.column_ids_, row, sql))) {
+    LOG_WARN("failed to build ai column task delete sql", K(ret));
+  } else if (sql.empty()) {
+    // the table has no ai column, nothing to do
+  } else if (OB_FAIL(begin_nested_session(false))) {
+    LOG_WARN("failed to begin nested session for ai column task cleanup", K(ret));
+  } else {
+    int end_ret = OB_SUCCESS;
+    if (OB_FAIL(execute_write(sql.ptr()))) {
+      LOG_WARN("failed to remove ai column tasks", K(ret), K(sql));
+    }
+    if (OB_FAIL(end_ret = end_nested_session())) {
+      LOG_WARN("failed to end nested session for ai column task cleanup", K(end_ret));
+      if (OB_SUCC(ret)) {
+        ret = end_ret;
+      }
+    }
+  }
+  return ret;
+}
+
 OB_INLINE uint64_t ObTableDeleteOp::ai_column_table_id()
 {
   uint64_t table_id = common::OB_INVALID_ID;
@@ -260,8 +288,7 @@ int ObTableDeleteOp::delete_row_to_das()
         break;
       } else if (OB_FAIL(calc_tablet_loc(del_ctdef, del_rtdef, tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::delete_row(del_ctdef, del_rtdef, tablet_loc, dml_rtctx_, modify_row.old_row_))) {
-      } else if (OB_FAIL(ObAIColumnTaskWriter::remove_tasks_for_deleted_row(
-                   ctx_, ai_column_table_id(), del_ctdef.column_ids_, *modify_row.old_row_))) {
+      } else if (OB_FAIL(remove_ai_column_tasks(del_ctdef, *modify_row.old_row_))) {
       } else if (need_after_row_process(del_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       } else {
         ++del_rtdef.cur_row_num_;

@@ -352,6 +352,70 @@ private:
   }
 
 public:
+  // Builds the inner SQL that removes the tasks of one deleted row. It runs
+  // through the DML operator's inner SQL connection so that it shares the user
+  // transaction, the same way a foreign key cascade does.
+  static int build_delete_task_sql(ObIAllocator &allocator,
+                                   const uint64_t table_id,
+                                   const ObIArray<uint64_t> &column_ids,
+                                   const ObChunkDatumStore::StoredRow &row,
+                                   ObString &sql)
+  {
+    int ret = OB_SUCCESS;
+    uint64_t user_table_id = table_id;
+    share::schema::ObSchemaGetterGuard guard;
+    const ObTableSchema *table_schema = NULL;
+    const ObTableSchema *task_schema = NULL;
+    ObString predicate;
+    const int64_t buf_len = 1024;
+    char *buf = NULL;
+    int64_t pos = 0;
+    bool has_ai_column = false;
+    sql.reset();
+    if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(buf_len)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(share::schema::ObMultiVersionSchemaService::get_instance()
+                         .get_runtime_schema_guard(guard))) {
+    } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema)) || OB_ISNULL(table_schema)) {
+    } else if (OB_FAIL(canonical_table_id(guard, *table_schema, user_table_id))) {
+    } else if (OB_FAIL(guard.get_table_schema(user_table_id, table_schema)) || OB_ISNULL(table_schema)) {
+    }
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && NULL != table_schema && !has_ai_column
+             && iter != table_schema->column_end();
+         ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (NULL != column && column->is_hidden()
+          && is_ai_request_column(column->get_column_name_str())) {
+        has_ai_column = true;
+      }
+    }
+    if (OB_FAIL(ret) || !has_ai_column) {
+      // no ai column on this table, nothing to remove
+    } else if (OB_FAIL(find_task_schema(guard, task_schema)) || OB_ISNULL(task_schema)) {
+    } else if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, column_ids, row, predicate))) {
+    } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                 "delete from oceanbase.`%.*s` where table_id = %lu and rowkey_predicate = '",
+                 static_cast<int>(task_schema->get_table_name_str().length()),
+                 task_schema->get_table_name_str().ptr(),
+                 user_table_id))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < predicate.length(); ++i) {
+      const char c = predicate.ptr()[i];
+      if ('\'' == c || '\\' == c) {
+        if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\\%c", c))) {
+        }
+      } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%c", c))) {
+      }
+    }
+    if (OB_SUCC(ret) && pos > 0) {
+      if (OB_FAIL(databuff_printf(buf, buf_len, pos, "'"))) {
+      } else if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(pos), buf), sql))) {
+      }
+    }
+    return ret;
+  }
+
   static int remove_tasks_for_deleted_row(ObExecContext &exec_ctx,
                                           const uint64_t table_id,
                                           const ObIArray<uint64_t> &column_ids,

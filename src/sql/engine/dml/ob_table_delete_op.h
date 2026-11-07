@@ -88,6 +88,8 @@ protected:
   int inner_open_with_das();
   int delete_row_to_das();
   uint64_t ai_column_table_id();
+  int remove_ai_column_tasks(const ObDelCtDef &del_ctdef,
+                             const ObChunkDatumStore::StoredRow &row);
   virtual int write_rows_post_proc(int last_errno);
   int calc_tablet_loc(const ObDelCtDef &del_ctdef,
                       ObDelRtDef &del_rtdef,
