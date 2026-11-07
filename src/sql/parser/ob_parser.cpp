@@ -22,9 +22,18 @@
 #include "parse_node.h"
 #include "ob_sql_parser.h"
 #include "sql/pl/parser/ob_pl_parser.h"
+#include "sql/parser/ob_parser_ai_retry.h"
 using namespace oceanbase::pl;
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
+
+namespace oceanbase
+{
+namespace sql
+{
+thread_local int64_t g_ai_retry_kind = 0;
+} // namespace sql
+} // namespace oceanbase
 
 ObParser::ObParser(common::ObIAllocator &allocator,
                    ObSQLMode mode,
@@ -1231,6 +1240,223 @@ std::string fsql_quote_literal(const std::string &text)
   return out;
 }
 
+
+bool fsql_is_ident_char(const char c)
+{
+  return ('_' == c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+         || (c >= '0' && c <= '9') || ('$' == c);
+}
+
+// Reads one (possibly backticked) identifier starting at pos.
+int64_t fsql_read_identifier(const std::string &text, int64_t pos, std::string &name)
+{
+  name.clear();
+  if (pos < static_cast<int64_t>(text.size()) && '`' == text[static_cast<size_t>(pos)]) {
+    ++pos;
+    while (pos < static_cast<int64_t>(text.size()) && '`' != text[static_cast<size_t>(pos)]) {
+      name.push_back(text[static_cast<size_t>(pos)]);
+      ++pos;
+    }
+    if (pos < static_cast<int64_t>(text.size())) { ++pos; }
+  } else {
+    while (pos < static_cast<int64_t>(text.size())
+           && fsql_is_ident_char(text[static_cast<size_t>(pos)])) {
+      name.push_back(text[static_cast<size_t>(pos)]);
+      ++pos;
+    }
+  }
+  return pos;
+}
+
+// Rewrites the STATUS pseudo column of a retry predicate into a check on the AI
+// column value itself: READY means the value is generated, FAILED means it is not.
+// A backticked `status` still addresses the physical column.
+std::string fsql_translate_ai_status(const std::string &pred, const std::string &col)
+{
+  std::string out;
+  size_t i = 0;
+  while (i < pred.size()) {
+    if ('`' == pred[i]) {
+      out.push_back(pred[i]);
+      ++i;
+      while (i < pred.size()) {
+        out.push_back(pred[i]);
+        if ('`' == pred[i]) { ++i; break; }
+        ++i;
+      }
+      continue;
+    }
+    if ('\'' == pred[i] || '"' == pred[i]) {
+      const char quote = pred[i];
+      out.push_back(pred[i]);
+      ++i;
+      while (i < pred.size()) {
+        out.push_back(pred[i]);
+        if ('\\' == pred[i] && i + 1 < pred.size()) {
+          out.push_back(pred[i + 1]);
+          i += 2;
+          continue;
+        }
+        if (pred[i] == quote) { ++i; break; }
+        ++i;
+      }
+      continue;
+    }
+    if (i + 6 <= pred.size() && 0 == strncasecmp(pred.c_str() + i, "status", 6)
+        && (0 == i || !fsql_is_ident_char(pred[i - 1]))
+        && (i + 6 >= pred.size() || !fsql_is_ident_char(pred[i + 6]))) {
+      size_t j = i + 6;
+      while (j < pred.size() && fsql_is_space(pred[j])) { ++j; }
+      bool replaced = false;
+      if (j < pred.size() && '=' == pred[j]) {
+        ++j;
+        while (j < pred.size() && fsql_is_space(pred[j])) { ++j; }
+        if (j < pred.size() && ('\'' == pred[j] || '"' == pred[j])) {
+          const char quote = pred[j];
+          size_t k = j + 1;
+          std::string value;
+          while (k < pred.size() && pred[k] != quote) { value.push_back(pred[k]); ++k; }
+          if (k < pred.size()) { ++k; }
+          if (0 == strcasecmp(value.c_str(), "READY")) {
+            out += "(" + col + " IS NOT NULL)";
+            replaced = true;
+          } else if (0 == strcasecmp(value.c_str(), "FAILED")) {
+            out += "(" + col + " IS NULL)";
+            replaced = true;
+          }
+          if (replaced) {
+            i = k;
+            continue;
+          }
+        }
+      }
+    }
+    out.push_back(pred[i]);
+    ++i;
+  }
+  return out;
+}
+
+// AI column retry support: rewrites
+//   alter table T retry ai column C [where P]
+// into an update of the same table. The alias marker tells the update resolver
+// where the statement came from, so that it can report the right errors.
+int fsql_rewrite_retry_ai_column(const ObString &query,
+                                 ObIAllocator &alloc,
+                                 ObString &rewritten)
+{
+  int ret = 1;
+  if (!query.empty()) {
+    const std::string text(query.ptr(), static_cast<size_t>(query.length()));
+    int64_t pos = fsql_skip_space(text, 0);
+    if (pos + 5 <= static_cast<int64_t>(text.size())
+        && fsql_lower_eq(text.c_str() + pos, "alter", 5)) {
+      pos = fsql_skip_space(text, pos + 5);
+      if (pos + 5 <= static_cast<int64_t>(text.size())
+          && fsql_lower_eq(text.c_str() + pos, "table", 5)) {
+        pos = fsql_skip_space(text, pos + 5);
+        const int64_t table_begin = pos;
+        std::string part;
+        pos = fsql_read_identifier(text, pos, part);
+        if (!part.empty()) {
+          int64_t after = fsql_skip_space(text, pos);
+          if (after < static_cast<int64_t>(text.size())
+              && '.' == text[static_cast<size_t>(after)]) {
+            int64_t cursor = fsql_skip_space(text, after + 1);
+            std::string second;
+            cursor = fsql_read_identifier(text, cursor, second);
+            if (!second.empty()) { pos = cursor; }
+          }
+        }
+        if (pos > table_begin) {
+          const std::string table_ref = text.substr(static_cast<size_t>(table_begin),
+                                                    static_cast<size_t>(pos - table_begin));
+          int64_t cursor = fsql_skip_space(text, pos);
+          bool is_retry = false;
+          if (cursor + 5 <= static_cast<int64_t>(text.size())
+              && fsql_lower_eq(text.c_str() + cursor, "retry", 5)) {
+            cursor = fsql_skip_space(text, cursor + 5);
+            if (cursor + 2 <= static_cast<int64_t>(text.size())
+                && fsql_lower_eq(text.c_str() + cursor, "ai", 2)) {
+              cursor = fsql_skip_space(text, cursor + 2);
+              if (cursor + 6 <= static_cast<int64_t>(text.size())
+                  && fsql_lower_eq(text.c_str() + cursor, "column", 6)) {
+                is_retry = true;
+                cursor = fsql_skip_space(text, cursor + 6);
+              }
+            }
+          }
+          if (is_retry) {
+            std::string column_name;
+            cursor = fsql_read_identifier(text, cursor, column_name);
+            if (!column_name.empty()) {
+              // find a top level comma (another alter action) and the where clause
+              bool mixed = false;
+              std::string predicate;
+              bool quoted = false;
+              char quote = '\0';
+              int64_t depth = 0;
+              const int64_t rest_begin = cursor;
+              for (int64_t i = cursor; i < static_cast<int64_t>(text.size()) && !mixed; ++i) {
+                const char c = text[static_cast<size_t>(i)];
+                if (quoted) {
+                  if ('\\' == c) { ++i; }
+                  else if (quote == c) { quoted = false; }
+                } else if ('\'' == c || '"' == c || '`' == c) {
+                  quoted = true;
+                  quote = c;
+                } else if ('(' == c) {
+                  ++depth;
+                } else if (')' == c) {
+                  --depth;
+                } else if (',' == c && 0 == depth) {
+                  mixed = true;
+                }
+              }
+              if (!mixed) {
+                int64_t p = fsql_skip_space(text, rest_begin);
+                if (p + 5 <= static_cast<int64_t>(text.size())
+                    && fsql_lower_eq(text.c_str() + p, "where", 5)
+                    && (p + 5 == static_cast<int64_t>(text.size())
+                        || !fsql_is_ident_char(text[static_cast<size_t>(p + 5)]))) {
+                  p = fsql_skip_space(text, p + 5);
+                  predicate = text.substr(static_cast<size_t>(p));
+                  while (!predicate.empty()
+                         && (fsql_is_space(predicate[predicate.size() - 1])
+                             || ';' == predicate[predicate.size() - 1])) {
+                    predicate.erase(predicate.size() - 1);
+                  }
+                  if (!predicate.empty()) {
+                    predicate = fsql_translate_ai_status(predicate, column_name);
+                  }
+                }
+              }
+              std::string sql = "update ";
+              sql += table_ref;
+              sql += " set ";
+              sql += column_name;
+              sql += " = NULL";
+              if (!mixed && !predicate.empty()) {
+                sql += " where ";
+                sql += predicate;
+              }
+              char *buf = static_cast<char *>(alloc.alloc(sql.size()));
+              if (NULL != buf) {
+                MEMCPY(buf, sql.c_str(), sql.size());
+                rewritten.assign_ptr(buf, static_cast<int32_t>(sql.size()));
+                g_ai_retry_kind = mixed ? 2 : 1;
+                LOG_INFO("ai retry rewrite", K(rewritten));
+                ret = 0;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int fsql_rewrite_copy(const ObString &query,
                       ObIAllocator &alloc,
                       ObString &rewritten)
@@ -1340,10 +1566,14 @@ int ObParser::parse(const ObString &query,
                     const bool is_parse_dynamic_sql)
 {
   ObString rewritten;
-  const ObString &real_query =
-      (NULL != allocator_ && 0 == fsql_rewrite_copy(query, *allocator_, rewritten))
-          ? rewritten : query;
-  return SMART_CALL(parse_(real_query,
+  const ObString *real_query = &query;
+  g_ai_retry_kind = 0;
+  if (NULL != allocator_ && 0 == fsql_rewrite_retry_ai_column(query, *allocator_, rewritten)) {
+    real_query = &rewritten;
+  } else if (NULL != allocator_ && 0 == fsql_rewrite_copy(query, *allocator_, rewritten)) {
+    real_query = &rewritten;
+  }
+  return SMART_CALL(parse_(*real_query,
                           parse_result,
                           parse_mode,
                           is_batched_multi_stmt_split_on,

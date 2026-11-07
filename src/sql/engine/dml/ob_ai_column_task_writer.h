@@ -7,6 +7,7 @@
 #include "lib/time/ob_time_utility.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_table_schema.h"
+#include "share/ai_service/ob_ai_column_state.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "storage/ob_table_dml_param.h"
@@ -222,6 +223,8 @@ private:
               LOG_INFO("insert ai column task row failed", K(ret), K(table_id));
               ret = OB_SUCCESS;
             } else {
+              share::ai_column_state().mark(table_id, base_name.ptr(), base_name.length(),
+                                            share::ObAIColumnState::PENDING);
               LOG_INFO("insert ai column task row", K(table_id),
                        "column_id", ai_column.get_column_id(), "affected", affected_rows);
             }
@@ -327,6 +330,24 @@ private:
     return changed;
   }
 
+
+  // An assignment to the AI column itself (a retry, or an explicit clear) always
+  // brings the value back to the recompute state, so it is never filtered out.
+  static bool assigned_self(const ObIArray<ObString> *assigned_names,
+                            const ObColumnSchemaV2 &ai_column)
+  {
+    bool assigned = false;
+    ObString ai_name = ai_column.get_column_name_str();
+    if (ai_name.length() > 9 && 0 == strncmp(ai_name.ptr(), "__ai_req_", 9)) {
+      ai_name = ObString(ai_name.length() - 9, ai_name.length() - 9, ai_name.ptr() + 9);
+    }
+    if (NULL != assigned_names) {
+      for (int64_t i = 0; !assigned && i < assigned_names->count(); ++i) {
+        assigned = (0 == assigned_names->at(i).case_compare(ai_name));
+      }
+    }
+    return assigned;
+  }
 
   static bool update_dependency_changed(const ObTableSchema &table_schema,
                                         const ObIArray<ObString> &assigned_names,
@@ -598,11 +619,12 @@ public:
           if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, column_ids, row, predicate))) {
             LOG_INFO("ai task predicate failed", K(ret), K(table_id),
                      "column_id", column->get_column_id());
-          } else if (filter_by_update
+          } else if (filter_by_update && !assigned_self(assigned_names, *column)
                      && (NULL == assigned_names
                          || !update_dependency_changed(*table_schema, *assigned_names,
                                                        *column))) {
-            // the columns referenced by this AI expression were not modified
+            // the columns referenced by this AI expression were not modified and
+            // the AI column itself keeps its value
           } else if (OB_FAIL(write_one_row(user_table_id, *task_schema, *column, row_request_id,
                                            predicate, *tx_desc, *access_service))) {
             LOG_INFO("ai task write one row failed", K(ret), K(table_id),

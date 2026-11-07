@@ -17,6 +17,7 @@
 #include "lib/string/ob_sql_string.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_define.h"
+#include "share/ai_service/ob_ai_column_state.h"
 
 namespace oceanbase
 {
@@ -229,6 +230,30 @@ private:
     return ret;
   }
 
+  // Number of tasks that are still queued for the column, -1 when unknown.
+  int64_t count_tasks(const std::string &table_id, const std::string &column_name)
+  {
+    int ret = common::OB_SUCCESS;
+    int64_t remaining = -1;
+    common::ObSqlString sql;
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      sqlclient::ObMySQLResult *result = NULL;
+      if (NULL == GCTX.sql_proxy_) {
+      } else if (OB_FAIL(sql.assign_fmt("select count(*) as c from oceanbase.__all_ai_column_task "
+                                        "where table_id = %s and column_name = '%s'",
+                                        table_id.c_str(), sql_escape(column_name).c_str()))) {
+      } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+      } else if (NULL == (result = res.get_result())) {
+      } else if (OB_SUCC(result->next())) {
+        int64_t count = 0;
+        if (OB_SUCC(result->get_int("c", count))) {
+          remaining = count;
+        }
+      }
+    }
+    return remaining;
+  }
+
   int64_t fetch_max_retries(const std::string &table_id, const std::string &column_name)
   {
     int ret = common::OB_SUCCESS;
@@ -344,6 +369,9 @@ private:
     LOG_INFO("ai column worker resolved table", K(db_name.c_str()), K(table_name.c_str()),
              K(column_name.c_str()));
     if (table_name.empty()) {
+      share::ai_column_state().mark(atoll(table_id.c_str()), column_name.c_str(),
+                                            static_cast<int64_t>(column_name.size()),
+                                          share::ObAIColumnState::FAILED);
       drop_task(table_id, rowkey, column_name);
       return common::OB_SUCCESS;
     }
@@ -452,6 +480,9 @@ private:
     LOG_INFO("ai column worker prepared", K(expr.c_str()), K(model.c_str()), K(url.c_str()),
              K(user_text.c_str()));
     if (url.empty()) {
+      share::ai_column_state().mark(atoll(table_id.c_str()), column_name.c_str(),
+                                   static_cast<int64_t>(column_name.size()),
+                                   share::ObAIColumnState::FAILED);
       drop_task(table_id, rowkey, column_name);
       return common::OB_SUCCESS;
     }
@@ -499,6 +530,9 @@ private:
           const int64_t retried = atoll(retry_count.c_str()) + 1;
           const int64_t max_retries = fetch_max_retries(table_id, column_name);
           if (retried > max_retries) {
+            share::ai_column_state().mark(atoll(table_id.c_str()), column_name.c_str(),
+                                                  static_cast<int64_t>(column_name.size()),
+                                          share::ObAIColumnState::FAILED);
             drop_task(table_id, rowkey, column_name);
           } else {
             common::ObSqlString upd;
@@ -657,6 +691,21 @@ private:
                                    batch[i].request_id.c_str(), delete_sql.c_str()))) {
           int64_t delcnt = 0;
           int tmp2 = GCTX.sql_proxy_->write(del.ptr(), delcnt);
+          if (0 == tmp2 && delcnt > 0) {
+            // one batch may carry several AI columns of the same row, and the
+            // delete above dropped all of them
+            for (size_t k = i; k < batch.size(); ++k) {
+              if (batch[k].request_id == batch[i].request_id
+                  && batch[k].rowkey == rowkey) {
+                const int64_t remaining = count_tasks(table_id, batch[k].column_name);
+                share::ai_column_state().mark(
+                    atoll(table_id.c_str()), batch[k].column_name.c_str(),
+                    static_cast<int64_t>(batch[k].column_name.size()),
+                    0 == remaining ? share::ObAIColumnState::READY
+                                   : share::ObAIColumnState::PENDING);
+              }
+            }
+          }
           LOG_INFO("ai column worker task dropped", K(tmp2), K(delcnt));
         }
       } else {

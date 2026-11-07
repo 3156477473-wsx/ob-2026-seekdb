@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_update_resolver.h"
+#include "sql/parser/ob_parser_ai_retry.h"
 
 namespace oceanbase
 {
@@ -87,6 +88,58 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(resolve_assignments(*assign_list,
                                            tables_assign,
                                            current_scope_))) {
+    }
+  }
+
+  LOG_INFO("ai retry resolver enter", K(g_ai_retry_kind));
+
+  // An AI column retry arrives as a plain update, because the retry statement
+  // itself is rewritten by the parser. The parser leaves what it saw in a thread
+  // local marker, so the marker is consumed here and a later statement cannot
+  // observe it.
+  if (OB_SUCC(ret)) {
+    const int64_t ai_retry_kind = g_ai_retry_kind;
+    g_ai_retry_kind = 0;
+    const bool ai_retry = (1 == ai_retry_kind);
+    const bool ai_retry_mixed = (2 == ai_retry_kind);
+    if (ai_retry_mixed) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+      ret = OB_NOT_SUPPORTED;
+    } else if (ai_retry) {
+      if (1 != tables_assign.count() || 1 != tables_assign.at(0).assignments_.count()) {
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        const ObAssignment &retry_assign = tables_assign.at(0).assignments_.at(0);
+        const ObColumnRefRawExpr *retry_column = retry_assign.column_expr_;
+        const ObTableSchema *retry_table_schema = NULL;
+        uint64_t retry_table_id = OB_INVALID_ID;
+        if (NULL != update_stmt) {
+          const ObIArray<TableItem*> &retry_table_items = update_stmt->get_table_items();
+          if (1 == retry_table_items.count() && OB_NOT_NULL(retry_table_items.at(0))) {
+            retry_table_id = retry_table_items.at(0)->ref_id_;
+          }
+        }
+        if (OB_ISNULL(retry_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(schema_checker_->get_table_schema(retry_table_id,
+                                                            retry_table_schema))) {
+          LOG_INFO("ai retry table id lookup failed", K(ret), K(retry_table_id),
+                   K(retry_column->get_column_name()));
+        } else if (OB_ISNULL(retry_table_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObSqlString hidden_name;
+          const ObString &retry_column_name = retry_column->get_column_name();
+          if (OB_FAIL(hidden_name.append_fmt("__ai_state_%.*s",
+                                             retry_column_name.length(),
+                                             retry_column_name.ptr()))) {
+          } else if (NULL == retry_table_schema->get_column_schema(hidden_name.string())) {
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+            ret = OB_NOT_SUPPORTED;
+          }
+        }
+      }
     }
   }
 
