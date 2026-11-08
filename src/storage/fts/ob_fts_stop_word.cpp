@@ -164,15 +164,31 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    // 快速路径：分词结果里绝大多数是纯中文（UTF-8 高位字节），不可能是
+    // 大写字母，tolower 的结果必定与原文相同，却要付出一次内存分配。
+    // 逐字节扫一遍（长度通常只有几个字节，远小于 tolower 的成本），
+    // 一旦发现 ASCII 范围内可能有大写字母才走原来的 tolower。
+    const ObString &src_str = src.get_word().get_string();
+    const char *p = src_str.ptr();
+    const int64_t len = src_str.length();
+    bool maybe_upper = false;
+    for (int64_t i = 0; !maybe_upper && i < len; ++i) {
+      const unsigned char c = static_cast<unsigned char>(p[i]);
+      maybe_upper = (c >= 'A' && c <= 'Z');
+    }
+    if (!maybe_upper) {
+      dst = src;
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;
