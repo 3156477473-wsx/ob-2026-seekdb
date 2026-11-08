@@ -49,15 +49,55 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    MEMCPY(buf, token.ptr_, token.len_);
-    word = buf;
-    word_len = token.len_;
-    char_len = token.len_;
-    word_freq = token_freq;
-    LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+    // token 指向 normalizer 内部缓冲，该缓冲在下一次 get_next() 时会被
+    // norm_allocator_.reuse() 覆盖，因此这里必须拷贝一份带出去的副本。
+    // 原先每个 token 都走一次 allocator_.alloc()，逐个小块分配；改为
+    // 按 token 长度从本解析器复用的缓冲区里切分，缓冲区只增不减，
+    // 大部分 token 不再需要真正分配。
+    if (OB_FAIL(ensure_token_buf(token.len_))) {
+    } else if (OB_ISNULL(buf = token_buf_ + token_buf_used_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      MEMCPY(buf, token.ptr_, token.len_);
+      token_buf_used_ += token.len_;
+      word = buf;
+      word_len = token.len_;
+      char_len = token.len_;
+      word_freq = token_freq;
+      LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+    }
+  }
+  return ret;
+}
+
+int ObBEngFTParser::ensure_token_buf(const int64_t need_len)
+{
+  int ret = OB_SUCCESS;
+  if (need_len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (token_buf_used_ + need_len <= token_buf_capacity_) {
+    // 现成空间够用，什么都不做
+  } else {
+    // 扩容：按 2 倍增长，避免逐 token 重新分配。
+    int64_t new_cap = (token_buf_capacity_ > 0) ? (token_buf_capacity_ * 2) : TOKEN_BUF_MIN_CAPACITY;
+    if (new_cap < token_buf_used_ + need_len) {
+      new_cap = token_buf_used_ + need_len;
+    }
+    char *new_buf = static_cast<char *>(allocator_.alloc(new_cap));
+    if (OB_ISNULL(new_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc token buf", K(ret), K(new_cap));
+    } else {
+      if (OB_NOT_NULL(token_buf_) && token_buf_used_ > 0) {
+        MEMCPY(new_buf, token_buf_, token_buf_used_);
+      }
+      if (OB_NOT_NULL(token_buf_)) {
+        allocator_.free(token_buf_);
+      }
+      token_buf_ = new_buf;
+      token_buf_capacity_ = new_cap;
+    }
   }
   return ret;
 }
@@ -110,7 +150,18 @@ void ObBEngFTParser::reset()
   english_analyzer_.reset();
   doc_.reset();
   token_stream_ = nullptr;
+  if (OB_NOT_NULL(token_buf_)) {
+    allocator_.free(token_buf_);
+    token_buf_ = nullptr;
+  }
+  token_buf_capacity_ = 0;
+  token_buf_used_ = 0;
   is_inited_ = false;
+}
+
+ObBEngFTParser::~ObBEngFTParser()
+{
+  reset();
 }
 
 ObBasicEnglishFTParserDesc::ObBasicEnglishFTParserDesc() {}

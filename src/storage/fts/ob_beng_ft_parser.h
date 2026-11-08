@@ -19,6 +19,7 @@
 
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/utility/ob_print_utils.h"
+#include "lib/ob_define.h"
 #include "share/text_analysis/ob_text_analyzer.h"
 #include "data_plane/fts/ob_fts_parser.h"
 
@@ -32,6 +33,9 @@ class ObBEngFTParser final : public ObITokenIterator
 public:
   static const int64_t FT_MIN_WORD_LEN = 3;
   static const int64_t FT_MAX_WORD_LEN = 84;
+  // token 拷贝缓冲区的最小容量。BENG 的单文档 token 总量一般远小于这个值，
+  // 因此多数文档只需一次分配。
+  static const int64_t TOKEN_BUF_MIN_CAPACITY = 4096;
 public:
   explicit ObBEngFTParser(common::ObIAllocator &allocator)
     : allocator_(allocator),
@@ -39,9 +43,12 @@ public:
       english_analyzer_(),
       doc_(),
       token_stream_(nullptr),
+      token_buf_(nullptr),
+      token_buf_capacity_(0),
+      token_buf_used_(0),
       is_inited_(false)
   {}
-  ~ObBEngFTParser() { reset(); }
+  ~ObBEngFTParser();
 
   int init(ObFTParserParam *param);
   void reset();
@@ -56,12 +63,19 @@ private:
   int segment(
       const common::ObDatum &doc,
       share::ObITokenStream *&token_stream);
+  // 确保 token 缓冲区能容纳当前已用长度再加上 need_len 字节。
+  int ensure_token_buf(const int64_t need_len);
 private:
   common::ObIAllocator &allocator_;
   share::ObTextAnalysisCtx analysis_ctx_;
   share::ObEnglishTextAnalyzer english_analyzer_;
   common::ObDatum doc_;
   share::ObITokenStream *token_stream_;
+  // token 拷贝缓冲区。原先每个 token 都做一次 allocator_.alloc()，
+  // 这里改成按需增长的连续缓冲区，每次只从里面切分，减少小块分配。
+  char *token_buf_;
+  int64_t token_buf_capacity_;
+  int64_t token_buf_used_;
   bool is_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObBEngFTParser);
