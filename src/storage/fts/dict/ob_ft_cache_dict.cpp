@@ -33,15 +33,56 @@ namespace oceanbase
 {
 namespace storage
 {
+ObFTCacheDict::~ObFTCacheDict()
+{
+  // Copies belong to the enclosing range view arena, not to the hub.
+  // Destroying that view reclaims copies from successful and failed builds.
+  owned_dat_ = nullptr;
+}
+
 int ObFTCacheDict::init()
 {
   int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(owned_alloc_)) {
+    // The dict owns a private copy of the dat block, copy it now.
+    if (OB_ISNULL(dat_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const int64_t copy_size = dat_->mem_block_size_;
+      char *buff = nullptr;
+      if (OB_UNLIKELY(copy_size < static_cast<int64_t>(sizeof(ObFTDAT)))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_ISNULL(buff = static_cast<char *>(owned_alloc_->alloc(copy_size)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(buff, dat_, copy_size);
+        owned_dat_ = reinterpret_cast<ObFTDAT *>(buff);
+        dat_ = owned_dat_;
+        reader_.set_dat(owned_dat_);
+        if (ObCollationType::CS_TYPE_UTF8MB4_BIN == coll_type_) {
+          // Build once before the owning shared view is published. Allocation
+          // failure only disables this optional accelerator; the copied DAT
+          // and the original map/cache lookup remain usable.
+          auto *codes = static_cast<ObFTWordCode *>(
+              owned_alloc_->alloc(ObArrayHashMap::BMP_CODE_COUNT * sizeof(ObFTWordCode)));
+          if (nullptr != codes) {
+            if (owned_dat_->get_map()->build_bmp_code_map(codes)) {
+              reader_.set_dat(owned_dat_, codes);
+            } else {
+              owned_alloc_->free(codes);
+            }
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 
-int ObFTCacheDict::match(const ObString &single_word, ObDATrieHit &hit) const
+int ObFTCacheDict::match(const ObString &single_word, ObDATrieHit &hit,
+                            ObFTCharCodeCache *char_cache) const
 {
-  return reader_.match_with_hit(single_word, hit, hit);
+  return reader_.match_with_hit(single_word, hit, hit, char_cache);
 }
 
 int ObFTCacheDict::match(const ObString &words, bool &is_match) const
@@ -71,9 +112,10 @@ int ObFTCacheDict::match(const ObString &words, bool &is_match) const
 
 int ObFTCacheDict::match_with_hit(const ObString &single_word,
                                   const ObDATrieHit &last_hit,
-                                  ObDATrieHit &hit) const
+                                  ObDATrieHit &hit,
+                                  ObFTCharCodeCache *char_cache) const
 {
-  return reader_.match_with_hit(single_word, last_hit, hit);
+  return reader_.match_with_hit(single_word, last_hit, hit, char_cache);
 }
 
 int ObFTCacheDict::make_and_fetch_cache_entry(const ObFTDictDesc &desc,

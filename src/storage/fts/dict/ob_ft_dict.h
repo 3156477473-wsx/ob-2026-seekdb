@@ -32,6 +32,7 @@ namespace storage
  * - Word means a single character in a language;
  */
 class ObIFTDict;
+class ObFTCharCodeCache;
 class ObDATrieHit final
 {
 public:
@@ -117,12 +118,14 @@ public:
   virtual int match(const ObString &words, bool &is_match) const = 0;
 
   // Match single word.
-  virtual int match(const ObString &single_word, ObDATrieHit &hit) const = 0;
+  virtual int match(const ObString &single_word, ObDATrieHit &hit,
+                    ObFTCharCodeCache *char_cache = nullptr) const = 0;
 
   // Match single word with hit.
   virtual int match_with_hit(const ObString &single_word,
                              const ObDATrieHit &last_hit,
-                             ObDATrieHit &hit) const = 0;
+                             ObDATrieHit &hit,
+                             ObFTCharCodeCache *char_cache = nullptr) const = 0;
 };
 
 } // namespace storage

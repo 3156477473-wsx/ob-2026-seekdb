@@ -22,6 +22,7 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/fts/dict/ob_ft_dict.h"
+#include "storage/fts/dict/ob_ft_dat_dict.h"
 #include "storage/fts/ik/ob_ik_char_util.h"
 #include "storage/fts/ik/ob_ik_token.h"
 
@@ -37,12 +38,17 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
   int ret = OB_SUCCESS;
 
   if (ObFTCharUtil::CharType::USELESS != type) {
+    // One character, one stack-owned memo across active prefixes and
+    // the new starting hit. No pointer to this scratch object escapes.
+    ObFTCharCodeCache char_cache;
+    // With no active prefix there is only one lookup, so bypass memo.
+    ObFTCharCodeCache *code_cache = hits_.empty() ? nullptr : &char_cache;
     // handle previous hits_ first and then check from this char
     for (ObList<ObDATrieHit, ObIAllocator>::iterator iter = hits_.begin();
          OB_SUCC(ret) && iter != hits_.end();
          iter++) {
       ObDATrieHit &hit = *iter;
-      if (OB_FAIL(dict_main_.match_with_hit({char_len, ch}, hit, hit))) {
+      if (OB_FAIL(dict_main_.match_with_hit({char_len, ch}, hit, hit, code_cache))) {
       } else if (hit.is_match()) {
         if (OB_FAIL(ctx.add_token(ctx.fulltext(),
                                   hit.start_pos_,
@@ -64,7 +70,7 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
       // Start from this char
       // find range of dict
       ObDATrieHit hit(&dict_main_, ctx.get_cursor());
-      if (OB_FAIL(dict_main_.match({char_len, ch}, hit))) {
+      if (OB_FAIL(dict_main_.match({char_len, ch}, hit, code_cache))) {
       } else if (hit.is_match()) {
         // output token
         hits_.push_back(hit);

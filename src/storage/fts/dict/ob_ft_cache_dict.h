@@ -37,12 +37,27 @@ public:
       : coll_type_(coll_type), dat_(dat), reader_(dat)
   {
   }
+  /**
+   * @brief build a dict over a private copy of the dat block.
+   *
+   * The kv-cache handle that pins a dat block is bound to the thread that
+   * acquired it, so it cannot be handed over to another thread. A shared
+   * dict view therefore owns a copy of the block instead of pinning the
+   * cache entry.
+   */
+  ObFTCacheDict(ObCollationType coll_type, ObFTDAT *dat, ObIAllocator &alloc)
+      : coll_type_(coll_type), dat_(dat), reader_(dat), owned_alloc_(&alloc), owned_dat_(nullptr)
+  {
+  }
+  ~ObFTCacheDict() override;
   int init() override;
-  int match(const ObString &single_word, ObDATrieHit &hit) const override;
+  int match(const ObString &single_word, ObDATrieHit &hit,
+                    ObFTCharCodeCache *char_cache = nullptr) const override;
   int match(const ObString &words, bool &is_match) const override;
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
-                     ObDATrieHit &hit) const override;
+                     ObDATrieHit &hit,
+                             ObFTCharCodeCache *char_cache = nullptr) const override;
 
 public:
   static int make_and_fetch_cache_entry(const ObFTDictDesc &desc,
@@ -57,6 +72,9 @@ private:
   ObCollationType coll_type_;
   ObFTDAT *dat_ = nullptr;
   ObFTDATReader<void> reader_;
+  // Set when the dict owns a private copy of the dat block.
+  ObIAllocator *owned_alloc_ = nullptr;
+  ObFTDAT *owned_dat_ = nullptr;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTCacheDict);

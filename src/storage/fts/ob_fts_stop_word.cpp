@@ -27,6 +27,76 @@ namespace oceanbase
 namespace storage
 {
 
+namespace {
+// Product data only: derive exact packed keys from the same immutable builtin
+// list that initializes StopWordSet. No SQL text, parser state or result cache.
+class BuiltinAsciiStopWords final
+{
+public:
+  BuiltinAsciiStopWords() : keys_(), count_(0), max_len_(0), valid_(true)
+  {
+    for (int64_t i = 0; valid_ && i < WORD_COUNT; ++i) {
+      const char *word = ob_stop_word_list[i];
+      int64_t len = 0;
+      while (len < FTS_STOP_WORD_MAX_LENGTH && word[len] != '\0') ++len;
+      if (len == 0 || len > 7 || len == FTS_STOP_WORD_MAX_LENGTH) {
+        valid_ = false;
+      } else {
+        uint64_t key = len;
+        for (int64_t j = 0; valid_ && j < len; ++j) {
+          const unsigned char c = static_cast<unsigned char>(word[j]);
+          valid_ = c >= 'a' && c <= 'z';
+          key = (key << 8) | c;
+        }
+        if (valid_) {
+          int64_t pos = 0;
+          while (pos < count_ && keys_[pos] < key) ++pos;
+          if (pos == count_ || keys_[pos] != key) {
+            for (int64_t j = count_; j > pos; --j) keys_[j] = keys_[j - 1];
+            keys_[pos] = key;
+            ++count_;
+          }
+          max_len_ = std::max(max_len_, len);
+        }
+      }
+    }
+  }
+  bool valid() const { return valid_ && count_ > 0; }
+  int64_t size() const { return count_; }
+  // Return true only when this exact ASCII domain was handled. Every other
+  // input continues through charset conversion and the authoritative set.
+  bool try_lookup(const common::ObString &word, bool &found) const
+  {
+    constexpr int64_t ASCII_SCAN_LIMIT = 64;
+    if (!valid() || word.empty() || word.length() > ASCII_SCAN_LIMIT) return false;
+    uint64_t key = word.length();
+    for (int64_t i = 0; i < word.length(); ++i) {
+      const unsigned char c = static_cast<unsigned char>(word.ptr()[i]);
+      if (c < 'a' || c > 'z') return false;
+      if (word.length() <= max_len_) key = (key << 8) | c;
+    }
+    found = false;
+    if (word.length() <= max_len_) {
+      int64_t lo = 0, hi = count_;
+      while (lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (keys_[mid] < key) lo = mid + 1;
+        else hi = mid;
+      }
+      found = lo < count_ && keys_[lo] == key;
+    }
+    return true;
+  }
+private:
+  static constexpr int64_t WORD_COUNT = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
+  uint64_t keys_[WORD_COUNT];
+  int64_t count_;
+  int64_t max_len_;
+  bool valid_;
+};
+const BuiltinAsciiStopWords builtin_ascii_stopwords;
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -58,6 +128,11 @@ int ObStopWordChecker::init()
 
     if (OB_SUCC(ret)) {
       inited_ = true;
+      // This flag is published only by the initializer that inserted every
+      // builtin word; a different/incomplete set never receives the shortcut.
+      builtin_ascii_fast_path_ = builtin_ascii_stopwords.valid()
+          && stopword_type_.get_collation_type() == common::CS_TYPE_UTF8MB4_GENERAL_CI
+          && stopword_set_.size() == builtin_ascii_stopwords.size();
     }
   }
   return ret;
@@ -69,6 +144,7 @@ void ObStopWordChecker::destroy()
     stopword_set_.destroy();
     inited_ = false;
   }
+  builtin_ascii_fast_path_ = false;
 }
 
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
@@ -76,12 +152,19 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   int ret = OB_SUCCESS;
   
   
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (builtin_ascii_fast_path_ && !word.get_word().is_null()
+      && word.get_word().flag_ == common::ObDatum::NONE
+      && (word.get_collation_type() == common::CS_TYPE_UTF8MB4_GENERAL_CI
+          || word.get_collation_type() == common::CS_TYPE_UTF8MB4_BIN
+          || word.get_collation_type() == common::CS_TYPE_BINARY)
+      && builtin_ascii_stopwords.try_lookup(word.get_word().get_string(), is_stopword)) {
+    // Exact lowercase ASCII membership in the existing builtin set.
   } else {
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
     // do nothing set out with in if type is the same.
     if (OB_FAIL(common::ObCharset::charset_convert(
@@ -198,20 +281,18 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    auto update_word = [&word, word_freq](common::hash::HashMapPair<ObFTWord, int64_t> &entry) {
+      // Preserve overwrite's latest representative key without replacing its node.
+      entry.first = word;
+      entry.second += word_freq;
+    };
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*first word count*/, update_word))) {
     }
   }
   return ret;

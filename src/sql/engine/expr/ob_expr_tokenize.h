@@ -71,6 +71,7 @@ private:
     mutable ObArenaAllocator allocator_;
     ObString parser_name_;
     ObString properties_;
+    bool use_default_properties_;
     ObObjMeta meta_;
     ObString fulltext_;
     enum OUTPUT_MODE

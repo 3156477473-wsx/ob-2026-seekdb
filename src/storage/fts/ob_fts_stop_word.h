@@ -88,6 +88,7 @@ private:
   ObObjMeta stopword_type_;
 
   bool inited_ = false;
+  bool builtin_ascii_fast_path_ = false;
 
   static_assert(sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]) <= DEFAULT_STOPWORD_BUCKET_NUM,
               "ob_stop_word_list's number shouldn't be greater than DEFAULT_STOPWORD_BUCKET_NUM");

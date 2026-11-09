@@ -31,6 +31,35 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+// Exactly one canonical UTF8 BMP scalar has a unique encoded byte string.
+// Other byte strings must retain the original raw-key map lookup.
+OB_INLINE bool get_utf8_bmp_index(const ObString &word, uint32_t &index)
+{
+  bool valid = false;
+  const auto *bytes = reinterpret_cast<const unsigned char *>(word.ptr());
+  if (nullptr == bytes) {
+  } else if (1 == word.length() && bytes[0] < 0x80) {
+    index = bytes[0];
+    valid = true;
+  } else if (2 == word.length()
+             && bytes[0] >= 0xC2 && bytes[0] <= 0xDF
+             && (bytes[1] & 0xC0) == 0x80) {
+    index = ((bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+    valid = true;
+  } else if (3 == word.length()
+             && bytes[0] >= 0xE0 && bytes[0] <= 0xEF
+             && (bytes[1] & 0xC0) == 0x80 && (bytes[2] & 0xC0) == 0x80
+             && (bytes[0] != 0xE0 || bytes[1] >= 0xA0)
+             && (bytes[0] != 0xED || bytes[1] < 0xA0)) {
+    index = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+    valid = true;
+  }
+  return valid;
+}
+} // namespace
+
 template <typename DATA_TYPE>
 int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
 {
@@ -249,18 +278,28 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              const ObDATrieHit &last_hit,
-                                             ObDATrieHit &hit) const
+                                             ObDATrieHit &hit,
+                                             ObFTCharCodeCache *char_cache) const
 {
   int ret = OB_SUCCESS;
-  ObFTWordCode code;
+  ObFTWordCode code = 0;
   hit.set_unmatch();
   auto *map = dat_->get_map();
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  int lookup_ret = OB_SUCCESS;
+  uint32_t bmp_index = 0;
+  if (nullptr != bmp_codes_ && get_utf8_bmp_index(ft_char, bmp_index)) {
+    code = bmp_codes_[bmp_index];
+    lookup_ret = 0 == code ? OB_ENTRY_NOT_EXIST : OB_SUCCESS;
+  } else {
+    ObFTSingleWord word;
+    word.set_word(ft_char.ptr(), ft_char.length());
+    lookup_ret = nullptr != char_cache
+        ? char_cache->lookup(dat_, word, code) : dat_->get_map()->find(word, code);
+  }
+  if (OB_FAIL(lookup_ret) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -314,6 +353,30 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
     }
   }
   return ret;
+}
+
+bool ObArrayHashMap::build_bmp_code_map(ObFTWordCode *codes) const
+{
+  bool valid = nullptr != codes;
+  bool has_bmp = false;
+  if (valid) {
+    MEMSET(codes, 0, BMP_CODE_COUNT * sizeof(*codes));
+    for (uint32_t i = 0; valid && i < header_.capacity_; ++i) {
+      const Entry &entry = header_.data[i];
+      uint32_t index = 0;
+      if (entry.used && get_utf8_bmp_index(entry.word.get_word(), index)) {
+        // Builder-assigned codes are positive. Reject ambiguous or unsupported
+        // values so the optional table can never hide the original map result.
+        if (entry.code <= 0 || (0 != codes[index] && codes[index] != entry.code)) {
+          valid = false;
+        } else {
+          codes[index] = entry.code;
+          has_bmp = true;
+        }
+      }
+    }
+  }
+  return valid && has_bmp;
 }
 
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)

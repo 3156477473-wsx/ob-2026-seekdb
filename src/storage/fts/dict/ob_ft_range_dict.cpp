@@ -312,6 +312,28 @@ int ObFTRangeDict::init()
   }
   return ret;
 }
+
+int ObFTRangeDict::init_with_container(const ObFTDictDesc &desc,
+                                       const ObFTCacheRangeContainer &range_container)
+{
+  int ret = OB_SUCCESS;
+  if (is_inited_) {
+    ret = OB_INIT_TWICE;
+  } else {
+    desc_ = desc;
+    // The published view must not retain a name from a caller's arena.
+    if (OB_FAIL(ob_write_string(range_alloc_, desc.name_, desc_.name_))) {
+    } else if (OB_FAIL(build_dict_from_cache(range_container))) {
+    } else {
+      is_inited_ = true;
+    }
+    if (OB_FAIL(ret)) {
+      destroy();
+    }
+  }
+  return ret;
+}
+
 int ObFTRangeDict::build_ranges(const ObFTDictDesc &desc,
                                 ObIFTDictIterator &iter,
                                 ObFTCacheRangeContainer &range_container)
@@ -332,7 +354,8 @@ int ObFTRangeDict::build_ranges(const ObFTDictDesc &desc,
   return ret;
 }
 
-int ObFTRangeDict::match(const ObString &single_word, ObDATrieHit &hit) const
+int ObFTRangeDict::match(const ObString &single_word, ObDATrieHit &hit,
+                            ObFTCharCodeCache *char_cache) const
 {
   int ret = OB_SUCCESS;
   ObIFTDict *dict = nullptr;
@@ -343,7 +366,7 @@ int ObFTRangeDict::match(const ObString &single_word, ObDATrieHit &hit) const
   } else {
     // do nothing
     hit.dict_ = dict; // set dict
-    if (OB_FAIL(dict->match(single_word, hit))) {
+    if (OB_FAIL(dict->match(single_word, hit, char_cache))) {
     }
   }
   return ret;
@@ -373,9 +396,10 @@ int ObFTRangeDict::match(const ObString &words, bool &is_match) const
 
 int ObFTRangeDict::match_with_hit(const ObString &single_word,
                                   const ObDATrieHit &last_hit,
-                                  ObDATrieHit &hit) const
+                                  ObDATrieHit &hit,
+                                  ObFTCharCodeCache *char_cache) const
 {
-  return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
+  return last_hit.dict_->match_with_hit(single_word, last_hit, hit, char_cache);
 }
 
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
@@ -411,14 +435,30 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
     ObFTCacheRangeHandle *ptr = *iter;
     ObFTCacheDict *dict = nullptr;
     ObFTDAT *dat = ptr->value_->dat_block_;
-    if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
+    if (own_copies_) {
+      // The dict copies the dat block, so it does not depend on the kv-cache
+      // handle of the container any more.
+      if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict,
+                                   &range_alloc_,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                   dat,
+                                   range_alloc_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+    } else if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      ObFTRange range;
-      range.start_ = dat->start_word_;
-      range.end_ = dat->end_word_;
-      range.dict_ = dict;
-      if (OB_FAIL(range_dicts_.push_back(range))) {
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(dict->init())) {
+        OB_DELETEx(ObFTCacheDict, &range_alloc_, dict);
+      } else {
+        ObFTRange range;
+        range.start_ = dat->start_word_;
+        range.end_ = dat->end_word_;
+        range.dict_ = dict;
+        if (OB_FAIL(range_dicts_.push_back(range))) {
+          OB_DELETEx(ObFTCacheDict, &range_alloc_, dict);
+        }
       }
     }
   }

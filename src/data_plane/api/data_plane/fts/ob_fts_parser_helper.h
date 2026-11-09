@@ -119,16 +119,19 @@ public:
 public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
   int get_dict_hub(ObFTDictHub *&hub);
+  int get_default_parser_property(const ObFTParser &parser, ObFTParserProperty &property) const;
 
 private:
   int init_and_set_stopword_list();
   int init_dict_hub();
+  int init_default_parser_properties();
 
 private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
   common::ObFIFOAllocator handler_allocator_;
   bool                    is_inited_         = false;
+  ObFTParserProperty default_parser_properties_[ObFTParser::FTP_MAX];
 };
 
 class ObFTParseHelper final
@@ -161,6 +164,9 @@ public:
       common::ObIAllocator *allocator,
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
+  // Uses immutable metadata derived from the original builtin defaults.
+  // Explicit parser properties continue through init() and its validation.
+  int init_default(common::ObIAllocator *allocator, const common::ObString &parser_name);
   /**
    * Split document into multiple words
    *

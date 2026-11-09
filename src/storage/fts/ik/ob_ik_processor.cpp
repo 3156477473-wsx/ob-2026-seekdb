@@ -31,6 +31,60 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+template <ObCharsetType CHARSET>
+int classify_decoded_ik_char(const ObCollationType collation,
+                            const char *input,
+                            const uint8_t length,
+                            ObFTCharUtil::CharType &type)
+{
+  ob_wc_t unicode = 0;
+  type = ObFTCharUtil::CharType::USELESS;
+  // Delegate malformed inputs so the original diagnostic and error path stays intact.
+  if (OB_UNLIKELY(input == nullptr)) {
+    return ObFTCharUtil::classify_first_char(collation, input, length, type);
+  }
+  const auto *begin = reinterpret_cast<const unsigned char *>(input);
+  if (OB_UNLIKELY(common::ob_charset_decode_unicode<CHARSET>(begin, begin + length, unicode) < 0)) {
+    return ObFTCharUtil::classify_first_char(collation, input, length, type);
+  }
+  if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+    type = ObFTCharUtil::CharType::ENGLISH_LETTER;
+  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+    type = ObFTCharUtil::CharType::ARABIC_LETTER;
+  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+    type = ObFTCharUtil::CharType::CHINESE;
+  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+    type = ObFTCharUtil::CharType::OTHER_CJK;
+  } else if ((CHARSET == CHARSET_UTF16 || CHARSET == CHARSET_UTF16LE)
+             && ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
+    type = ObFTCharUtil::CharType::SURROGATE_HIGH;
+  } else if ((CHARSET == CHARSET_UTF16 || CHARSET == CHARSET_UTF16LE)
+             && ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
+    type = ObFTCharUtil::CharType::SURROGATE_LOW;
+  }
+  return OB_SUCCESS;
+}
+
+int classify_ik_current_char(const ObCollationType collation,
+                             const char *input,
+                             const uint8_t length,
+                             ObFTCharUtil::CharType &type)
+{
+  switch (ObCharset::charset_type_by_coll(collation)) {
+    case CHARSET_UTF8MB4:
+      return classify_decoded_ik_char<CHARSET_UTF8MB4>(collation, input, length, type);
+    case CHARSET_UTF16:
+      return classify_decoded_ik_char<CHARSET_UTF16>(collation, input, length, type);
+    case CHARSET_UTF16LE:
+      return classify_decoded_ik_char<CHARSET_UTF16LE>(collation, input, length, type);
+    default:
+      return ObFTCharUtil::classify_first_char(collation, input, length, type);
+  }
+}
+} // namespace
+
 int ObIIKProcessor::process(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
@@ -106,7 +160,7 @@ int TokenizeContext::prepare_next_char()
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
+  } else if (OB_FAIL(classify_ik_current_char(coll_type_,
                                                        fulltext_ + cursor_,
                                                        next_char_len_,
                                                        next_char_type_))) {

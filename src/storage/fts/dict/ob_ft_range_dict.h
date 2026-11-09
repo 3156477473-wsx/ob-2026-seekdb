@@ -42,7 +42,18 @@ public:
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
-  ~ObFTRangeDict() override{};
+  ~ObFTRangeDict() override { destroy(); }
+
+  /**
+   * @brief make the range dict own a private copy of the dat blocks.
+   *
+   * The kv-cache handles that pin the dat blocks belong to the thread that
+   * acquired them, so a range dict that is shared between threads must not
+   * keep using them. When own_copies is set, every range dict copies the dat
+   * block into this view's range arena and the range dict stops depending on the
+   * kv-cache handles of the container.
+   */
+  void set_own_copies() { own_copies_ = true; }
 
 public:
   struct ObFTRange final
@@ -54,11 +65,22 @@ public:
 
 public:
   int init() override;
-  int match(const ObString &single_word, ObDATrieHit &hit) const override;
+  /**
+   * @brief build the range dict from a container that the caller owns.
+   *
+   * The range dict does not keep the container, so the caller may release the
+   * kv-cache handles of the container right after this call returns. This is
+   * used by the shared dict views, which own private copies of the
+   * dictionary blocks.
+   */
+  int init_with_container(const ObFTDictDesc &desc, const ObFTCacheRangeContainer &range_container);
+  int match(const ObString &single_word, ObDATrieHit &hit,
+                    ObFTCharCodeCache *char_cache = nullptr) const override;
   int match(const ObString &words, bool &is_match) const override;
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
-                     ObDATrieHit &hit) const override;
+                     ObDATrieHit &hit,
+                             ObFTCharCodeCache *char_cache = nullptr) const override;
 
 public:
   int build_dict_from_cache(const ObFTCacheRangeContainer &range_container);
@@ -93,8 +115,11 @@ private:
     for (int64_t i = 0; i < range_dicts_.size(); i++) {
       range_dicts_[i].dict_->~ObIFTDict(); // destroy dict
     }
-    range_dicts_.reset();
+    ObVector<ObFTRange, ObArenaAllocator> empty_ranges(&range_alloc_);
+    // Empty assignment clears storage pointers before the arena resets.
+    (void)range_dicts_.assign(empty_ranges);
     range_alloc_.reset();
+    is_inited_ = false;
   }
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
@@ -106,6 +131,9 @@ private:
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
   ObFTCacheRangeContainer *range_container_; // only used to read cache
+  // When set, every range dict owns a private copy of its dat block, so the
+  // range dict stays valid after the kv-cache handles are released.
+  bool own_copies_ = false;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTRangeDict);

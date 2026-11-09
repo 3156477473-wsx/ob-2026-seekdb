@@ -95,10 +95,15 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
   } else {
     const char *doc = input_doc_->ptr_;
     const uint32_t doc_len = get_input_buf_len();
+    // All UTF-8 collations share this character handler. ASCII is always one
+    // byte; retain the charset implementation for multibyte/invalid input and
+    // every other character set.
+    const bool utf8 = cs_->cset == ob_charset_utf8mb4_bin.cset;
     int64_t token_len = 0;
     // to next non-whitespace pos
     while (OB_SUCC(ret) && found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const int64_t c_len = utf8 && static_cast<unsigned char>(doc[trav_pos_]) < 0x80
+          ? 1 : ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
       trav_pos_ += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
         iter_end_ = true;
@@ -112,7 +117,8 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
     // to next whitespace pos
     while (OB_SUCC(ret) && !found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const int64_t c_len = utf8 && static_cast<unsigned char>(doc[trav_pos_]) < 0x80
+          ? 1 : ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
       trav_pos_ += c_len;
       token_len += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {
@@ -293,11 +299,28 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else if (OB_UNLIKELY(!found_alnum)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      ObString norm_alnum_token(norm_token_len, norm_token_ptr);
-      ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      // Bound the extra work before falling back to the charset converter.
+      constexpr uint32_t ASCII_SCAN_LIMIT = 64;
+      const auto is_lower_ascii = [](const unsigned char byte) {
+        return byte < 0x80 && (byte < 'A' || byte > 'Z');
+      };
+      bool lower_ascii = cs_->cset == ob_charset_utf8mb4_bin.cset
+          && norm_token_len <= ASCII_SCAN_LIMIT
+          && is_lower_ascii(static_cast<unsigned char>(norm_token_ptr[0]))
+          && is_lower_ascii(static_cast<unsigned char>(norm_token_ptr[norm_token_len - 1]));
+      for (uint32_t i = 1; lower_ascii && i + 1 < norm_token_len; ++i) {
+        lower_ascii = is_lower_ascii(static_cast<unsigned char>(norm_token_ptr[i]));
+      }
+      if (lower_ascii) {
+        // The input remains valid until the parser makes its existing deep copy.
+        next_token.set_string(norm_token_ptr, norm_token_len);
       } else {
-        next_token.set_string(norm_lower_token);
+        ObString norm_alnum_token(norm_token_len, norm_token_ptr);
+        ObString norm_lower_token;
+        if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+        } else {
+          next_token.set_string(norm_lower_token);
+        }
       }
     }
   }

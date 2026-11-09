@@ -67,6 +67,10 @@ public:
 
   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
 
+  // Optional derived lookup; adds no fields to this serialized map.
+  static constexpr uint32_t BMP_CODE_COUNT = 1U << 16;
+  bool build_bmp_code_map(ObFTWordCode *codes) const;
+
 private:
   struct Header header_;
 } __attribute__((packed));
@@ -159,6 +163,48 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObFTDATBuilder);
 };
 
+// Scratch state for one processor input character. Never stored in a shared
+// dict/reader: DAT identity and the complete encoded character are the key.
+class ObFTCharCodeCache final
+{
+public:
+  ObFTCharCodeCache() : word_(), size_(0) {}
+  int lookup(ObFTDAT *dat, const ObFTSingleWord &word, ObFTWordCode &code)
+  {
+    if (0 == size_ || !(word_ == word)) {
+      word_ = word;
+      size_ = 0;
+    }
+    for (int64_t i = 0; i < size_; ++i) {
+      if (entries_[i].dat_ == dat) {
+        code = entries_[i].code_;
+        return entries_[i].status_;
+      }
+    }
+    const int ret = dat->get_map()->find(word, code);
+    // A dictionary miss is deterministic too. Other errors must be retried
+    // through the old path rather than remembered by this scratch cache.
+    if ((OB_SUCCESS == ret || OB_ENTRY_NOT_EXIST == ret) && size_ < CAPACITY) {
+      entries_[size_].dat_ = dat;
+      entries_[size_].code_ = OB_SUCCESS == ret ? code : 0;
+      entries_[size_].status_ = ret;
+      ++size_;
+    }
+    return ret;
+  }
+
+private:
+  static constexpr int64_t CAPACITY = 4;
+  struct Entry {
+    ObFTDAT *dat_;
+    ObFTWordCode code_;
+    int status_;
+  };
+  ObFTSingleWord word_;
+  int64_t size_;
+  Entry entries_[CAPACITY];
+};
+
 /**
  * @class ObFTDATReader
  * @brief Reader to do match on a mem block dat.
@@ -167,15 +213,27 @@ template <typename DataType = void>
 class ObFTDATReader
 {
 public:
-  ObFTDATReader(ObFTDAT *dat) : dat_(dat) {}
+  ObFTDATReader(ObFTDAT *dat) : dat_(dat), bmp_codes_(nullptr) {}
+
+  // Point the reader at another dat block, e.g. after the owner made a
+  // private copy of the block.
+  // A rebind without an accelerator must clear the previous DAT's codes.
+  // Both blocks are immutable and owned by the enclosing range view arena.
+  void set_dat(ObFTDAT *dat, const ObFTWordCode *bmp_codes = nullptr)
+  {
+    dat_ = dat;
+    bmp_codes_ = bmp_codes;
+  }
 
   // Match single word with hit.
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
-                     ObDATrieHit &hit) const;
+                     ObDATrieHit &hit,
+                     ObFTCharCodeCache *char_cache = nullptr) const;
 
 private:
   ObFTDAT *dat_;
+  const ObFTWordCode *bmp_codes_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTDATReader);

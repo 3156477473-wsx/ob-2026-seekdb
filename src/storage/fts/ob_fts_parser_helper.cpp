@@ -185,6 +185,7 @@ int ObFTParseData::init()
                                       mem_attr))) {
   } else if (OB_FAIL(init_and_set_stopword_list())) {
   } else if (OB_FAIL(init_dict_hub())) {
+  } else if (OB_FAIL(init_default_parser_properties())) {
   } else {
     is_inited_ = true;
     FLOG_INFO("succeeded to initialize fulltext parser data", KP(this));
@@ -219,6 +220,53 @@ int ObFTParseData::init_dict_hub()
   if (OB_ISNULL(dict_hub_ = OB_NEWx(ObFTDictHub, &handler_allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(dict_hub_->init())) {
+  }
+  return ret;
+}
+
+int ObFTParseData::init_default_parser_properties()
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < ObFTParser::FTP_MAX; ++i) {
+    ObFTParser parser;
+    ObFTParserJsonProps properties;
+    common::ObArenaAllocator allocator("FTDefaultProps");
+    ObString json;
+    char name[OB_FT_PARSER_NAME_LENGTH];
+    // Keep the original validation/defaulting path as the single source of
+    // truth. No input text, token stream or query result is retained here.
+    if (OB_FAIL(parser.init(ObString::make_string(ObFTParser::NAME_STR[i])))) {
+    } else if (OB_FAIL(parser.serialize_to_str(name, sizeof(name)))) {
+    } else if (OB_FAIL(properties.init())) {
+    } else if (OB_FAIL(properties.parse_from_valid_str(ObString()))) {
+    } else if (OB_FAIL(properties.rebuild_props_for_ddl(
+                   ObString::make_string(name), CS_TYPE_UTF8MB4_BIN, false))) {
+    } else if (OB_FAIL(properties.to_format_json(allocator, json))) {
+    } else if (OB_FAIL(default_parser_properties_[i].parse_for_parser_helper(parser, json))) {
+    }
+  }
+  return ret;
+}
+
+int ObFTParseData::get_default_parser_property(
+    const ObFTParser &parser, ObFTParserProperty &property) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(!parser.is_valid()
+                        || parser.get_parser_version() != ObFTParser::BUILTIN_VERSION)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    bool found = false;
+    for (int64_t i = 0; !found && i < ObFTParser::FTP_MAX; ++i) {
+      if (parser.get_parser_name() == ObFTParserName(ObFTParser::NAME_STR[i])) {
+        // Property strings refer to product literals, not to the temporary JSON.
+        property = default_parser_properties_[i];
+        found = true;
+      }
+    }
+    if (OB_UNLIKELY(!found)) ret = OB_FUNCTION_NOT_DEFINED;
   }
   return ret;
 }
@@ -350,6 +398,28 @@ int ObFTParseHelper::init(
   return ret;
 }
 
+int ObFTParseHelper::init_default(
+    common::ObIAllocator *allocator, const common::ObString &parser_name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
+  } else if (OB_FAIL(ObFTParseData::instance().get_default_parser_property(parser_name_, parser_property_))) {
+  } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
+  } else if (OB_ISNULL(parser_desc_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
+  } else {
+    allocator_ = allocator;
+    is_inited_ = true;
+  }
+  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) reset();
+  return ret;
+}
+
 void ObFTParseHelper::reset()
 {
   parser_desc_ = nullptr;
@@ -377,7 +447,10 @@ int ObFTParseHelper::segment(
   } else if (OB_ISNULL(cs = common::ObCharset::get_charset(type))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    words.reuse();
+    // A newly created map has no nodes to release; avoid walking its empty buckets.
+    if (!words.empty()) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,
