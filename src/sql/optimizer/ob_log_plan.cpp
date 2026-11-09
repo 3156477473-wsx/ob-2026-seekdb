@@ -17,7 +17,6 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "config_bridge.h"
 #include "ob_log_plan.h"
-#include "sql/engine/basic/file_sql_bridge.h"
 #include "sql/optimizer/ob_pwj_comparer.h"
 #include "sql/optimizer/stat/ob_opt_stat_manager.h"
 #include "sql/optimizer/ob_log_table_scan.h"
@@ -6878,28 +6877,10 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_buffer_size(into_item->buffer_size_);
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
-      if (filesql::is_copy_descriptor(into_item->external_properties_)) {
-        filesql::ScanDefinition copy;
-        ObString encoded;
-        if (OB_FAIL(filesql::decode_scan(into_item->external_properties_, copy))) {
-        } else {
-          copy.columns.clear();
-          for (int64_t i = 0; i < stmt->get_select_item_size(); ++i) {
-            const SelectItem &item = stmt->get_select_item(i);
-            const ObString &name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
-            filesql::Column column;
-            column.name.assign(name.ptr() == nullptr ? "" : name.ptr(), name.length());
-            copy.columns.push_back(std::move(column));
-          }
-          if (OB_FAIL(filesql::encode_scan(copy, get_allocator(), encoded))) {
-          } else { select_into->set_external_properties(encoded); }
-        }
-      } else {
-        select_into->set_external_properties(into_item->external_properties_);
-      }
+      select_into->set_external_properties(into_item->external_properties_);
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
-      if (OB_SUCC(ret) && OB_FAIL(select_into->compute_property())) {
+      if (OB_FAIL(select_into->compute_property())) {
       } else {
         old_top = select_into;
       }
