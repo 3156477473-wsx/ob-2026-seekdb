@@ -19,7 +19,6 @@
 #include "config_bridge.h"
 #include "sql/code_generator/ob_code_generator.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
-#include "sql/code_generator/ob_dml_cg_service.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "share/schema/ob_schema_getter_guard.h"
@@ -201,11 +200,7 @@ int ObCodeGenerator::generate(const ObLogPlan &log_plan,
 {
   int ret = OB_SUCCESS;
   int64_t batch_size = 0;
-  bool has_ai_columns = false;
-  OZ(ObDmlCgService::prepare_ai_expressions(*log_plan.get_plan_root(), has_ai_columns));
-  if (OB_SUCC(ret) && !has_ai_columns) {
-    OZ(detect_batch_size(log_plan, batch_size));
-  }
+  OZ(detect_batch_size(log_plan, batch_size));
   if (OB_SUCC(ret) && batch_size > 0) {
     log_plan.get_optimizer_context().set_batch_size(batch_size);
     phy_plan.set_batch_size(batch_size);

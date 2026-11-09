@@ -5705,11 +5705,6 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
   } else {
     spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
     spec.value_expr_ = value_expr;
-    const TableItem *file_table = op.get_stmt()->get_table_item_by_id(op.get_table_id());
-    if (file_table != nullptr && !file_table->file_sql_descriptor_.empty()) {
-      OZ (ob_write_string(alloc, file_table->file_sql_descriptor_, spec.file_sql_descriptor_));
-      OZ (spec.file_sql_column_indices_.init(op.get_stmt()->get_column_size()));
-    }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {
       }
@@ -5725,9 +5720,6 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
-        if (!spec.file_sql_descriptor_.empty()) {
-          OZ (spec.file_sql_column_indices_.push_back(col_item->column_id_ - OB_APP_MIN_COLUMN_ID));
-        }
       }
     }
   }
@@ -6319,10 +6311,6 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_FUNCTION_TABLE: {
       type = PHY_FUNCTION_TABLE;
-      const auto &file_op = static_cast<const ObLogFunctionTable &>(log_op);
-      const TableItem *table = log_op.get_stmt() == nullptr ? nullptr
-          : log_op.get_stmt()->get_table_item_by_id(file_op.get_table_id());
-      if (table != nullptr && !table->file_sql_descriptor_.empty()) { type = PHY_FILE_SQL_TABLE; }
       break;
     }
     case log_op_def::LOG_JSON_TABLE: {
