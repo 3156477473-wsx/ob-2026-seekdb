@@ -50,6 +50,10 @@ public:
 
   int init(const ObFTParserParam &param);
 
+  // 跨调用复用解析器：重建绑定新文档的 ctx（原地 rebind），
+  // 词典视图与 segmenter 保持不变。
+  int reinit_ctx(const ObFTParserParam &param);
+
   int get_next_token(const char *&word,
                      int64_t &word_len,
                      int64_t &char_cnt,

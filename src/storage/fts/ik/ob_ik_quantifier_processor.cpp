@@ -196,6 +196,8 @@ void ObIKQuantifierProcessor::reset()
   start_ = -1;
   end_ = -1;
   quan_char_cnt_ = 0;
+  // 复用时清掉上一行未结算的词典命中，避免跨文档残留。
+  count_hits_.reset();
 }
 
 } //  namespace storage
