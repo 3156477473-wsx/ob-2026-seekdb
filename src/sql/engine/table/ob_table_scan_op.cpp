@@ -1651,6 +1651,9 @@ int ObTableScanOp::inner_rescan()
   if (OB_FAIL(try_check_status())) {
   } else if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
+    if (MY_SPEC.is_fts_ddl_ && MY_SPEC.is_vectorized()) {
+      fts_index_.reuse();
+    }
     if (OB_FAIL(inner_rescan_for_tsc())) {
     }
   }
@@ -2199,7 +2202,81 @@ ERRSIM_POINT_DEF(EN_TABLE_SCAN_RETRY_WAIT_EVENT_ERRSIM);
 int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
+  if (MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_
+      && !MY_SPEC.is_spatial_ddl() && !MY_SPEC.is_multivalue_ddl()
+      && !MY_SPEC.is_spiv_ddl()) {
+    // Output rows belong to exactly one document. Fetching/segmenting a later
+    // document resets their backing arena, so it must wait for the next call.
+    const int64_t capacity = min(max_row_cnt, MY_SPEC.max_batch_size_);
+    clear_evaluated_flag();
+    brs_.size_ = 0;
+    brs_.end_ = false;
+    ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+    guard.set_batch_size(1);
+    guard.set_batch_idx(0);
+    blocksstable::ObDatumRow *row = nullptr;
+    if (capacity <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(fts_index_.get_next_row(row))) {
+      if (OB_ITER_END != ret) {
+      } else if (OB_FAIL(fetch_next_fts_index_rows())) {
+      } else if (OB_FAIL(fts_index_.get_next_row(row))) {
+      }
+    }
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      brs_.end_ = true;
+    } else if (OB_SUCC(ret)) {
+      brs_.skip_->reset(capacity);
+      // Scalar DAS writes only slot zero. Retain that integer before emitting
+      // each term; it is unchanged while the current document stays cached.
+      ObDatum partition_id;
+      ObExpr *partition_expr = MY_SPEC.output_.count() == 5 ? MY_SPEC.pdml_partition_id_ : nullptr;
+      if (nullptr != partition_expr) {
+        partition_id = partition_expr->locate_expr_datum(eval_ctx_, 0);
+      }
+      while (OB_SUCC(ret) && brs_.size_ < capacity) {
+        guard.set_batch_size(capacity);
+        guard.set_batch_idx(brs_.size_);
+        if (OB_FAIL(fill_generated_fts_cols(row))) {
+        } else {
+          if (nullptr != partition_expr) {
+            partition_expr->locate_datum_for_write(eval_ctx_) = partition_id;
+            partition_expr->set_evaluated_projected(eval_ctx_);
+          }
+          ++brs_.size_;
+          if (brs_.size_ == capacity) {
+            break;
+          } else if (OB_FAIL(fts_index_.get_next_row(row))) {
+            if (OB_ITER_END == ret) {
+              ret = OB_SUCCESS;
+            }
+            break;
+          }
+        }
+      }
+      brs_.all_rows_active_ = true;
+    }
+  } else if (MY_SPEC.is_fts_ddl_) {
+    // Preserve scalar sample/domain behavior. Calling the public one-row
+    // adapter here would recurse because this operator has a batch spec.
+    ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+    guard.set_batch_size(1);
+    guard.set_batch_idx(0);
+    clear_evaluated_flag();
+    if (OB_FAIL(inner_get_next_row())) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        brs_.size_ = 0;
+        brs_.end_ = true;
+      }
+    } else {
+      brs_.size_ = 1;
+      brs_.end_ = false;
+      brs_.skip_->unset(0);
+      brs_.all_rows_active_ = true;
+    }
+  } else if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
     if (OB_FAIL(rand_scan_processor_.inner_get_next_batch(max_row_cnt))) {
     }
   } else if (OB_FAIL(inner_get_next_batch_for_tsc(max_row_cnt))) {
@@ -3765,7 +3842,7 @@ int ObRandScanProcessor::init(const ObTableScanSpec *tsc_spec,
   int ret = OB_SUCCESS;
   int tmp_ret = OB_E(EventTable::EN_ENABLE_RANDOM_TSC) OB_SUCCESS;
   if (OB_UNLIKELY(tmp_ret != OB_SUCCESS)) {
-    if (0 != tsc_spec->max_batch_size_) {
+    if (0 != tsc_spec->max_batch_size_ && !tsc_spec->is_fts_ddl_) {
       int skip_buf_size = ObBitVector::memory_size(tsc_spec->max_batch_size_);
       void *skip_buf = tsc_op->ctx_.get_allocator().alloc(skip_buf_size);
       if (OB_ISNULL(skip_buf)) {

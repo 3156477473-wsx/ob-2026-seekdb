@@ -24,6 +24,9 @@
 #include "storage/ddl/ob_ddl_independent_dag.h"  // ObDDLIndependentDag complete type
 #include "share/ob_rpc_struct.h"
 #include "share/ob_ddl_checksum.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_table_schema.h"
 #include "share/ob_ddl_sim_point.h"
 #include "common/object/ob_object.h"
 #include "share/tablet/ob_tablet_table_operator.h"
@@ -57,6 +60,19 @@ using namespace oceanbase::sql;
 namespace
 {
 constexpr int64_t MACRO_STEP_SIZE = 0x1 << 25;
+
+// A failed/missing schema qualification keeps the original completion pause.
+// DocId map and all non-FTS targets deliberately retain the generic path.
+bool is_fts_checksum_target(const uint64_t table_id)
+{
+  ObSchemaGetterGuard guard;
+  const ObTableSchema *schema = nullptr;
+  return OB_SUCCESS == ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard)
+      && OB_SUCCESS == guard.check_formal_guard()
+      && OB_SUCCESS == guard.get_table_schema(table_id, schema)
+      && nullptr != schema && schema->get_table_id() == table_id
+      && (schema->is_fts_index_aux() || schema->is_fts_doc_word_aux());
+}
 }
 
 // File-local LOB helpers shared by the Storage DDL algorithms below.
@@ -215,6 +231,7 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
   } else {
     const int64_t *column_checksums = sst_meta_hdl.get_sstable_meta().get_col_checksum();
     int64_t column_count = sst_meta_hdl.get_sstable_meta().get_col_checksum_cnt();
+    bool skip_success_pause = false;
     for (int64_t retry_cnt = 10; retry_cnt > 0; retry_cnt--) { // overwrite ret
       if (OB_FAIL(ObTabletDDLUtil::report_ddl_checksum(tablet_id,
                                                       target_table_id,
@@ -224,10 +241,18 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
                                                       column_count,
                                                       data_format_version))) {
       } else {
+        // InnerSQL returns only after synchronous autocommit. Any preceding
+        // report failure must retain the original retry-completion backoff.
+        skip_success_pause = retry_cnt == 10 && is_fts_checksum_target(target_table_id);
         break;
       }
     }
-    ob_usleep(100L * 1000L);
+    if (skip_success_pause) {
+      LOG_INFO("FTS checksum report completed without fixed pause", K(tablet_id),
+          K(target_table_id), K(execution_id), K(ddl_task_id));
+    } else {
+      ob_usleep(100L * 1000L);
+    }
   }
   return ret;
 }

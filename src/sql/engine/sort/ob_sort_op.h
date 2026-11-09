@@ -40,7 +40,7 @@ public:
   INHERIT_TO_STRING_KV("op_spec", ObOpSpec,
     K_(topn_expr), K_(topk_limit_expr), K_(topk_offset_expr), K_(prefix_pos),
     K_(minimum_row_count), K_(topk_precision), K_(prefix_pos), K_(is_local_merge_sort),
-    K_(prescan_enabled), K_(enable_encode_sortkey_opt), K_(part_cnt),
+    K_(prescan_enabled), K_(fts_single_pass_plan), K_(enable_encode_sortkey_opt), K_(part_cnt),
     K_(compress_type), K_(pd_topn_filter_info));
 
   inline bool enable_pd_topn_filter() const { return pd_topn_filter_info_.enabled_; }
@@ -63,6 +63,8 @@ public:
   bool is_local_merge_sort_;
   bool is_fetch_with_ties_;
   bool prescan_enabled_;
+  // Complete-plan certificate; runtime also requires one post-sampling stream.
+  bool fts_single_pass_plan_;
   bool enable_encode_sortkey_opt_;
   // if use, all_exprs_ is : hash(part_by) + part_by + order_by.
   int64_t part_cnt_;

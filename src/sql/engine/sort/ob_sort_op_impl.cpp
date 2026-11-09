@@ -20,6 +20,7 @@
 #include "ob_sort_op_impl.h"
 #include "query/engine/basic/ob_encoded_sort_row.h"
 #include "data_plane/encoding/ob_cpu_features.h"
+#include "lib/charset/ob_charset.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
 
 namespace oceanbase
@@ -559,6 +560,7 @@ bool ObSortOpImpl::Compare::operator()(
 ObSortOpImpl::ObSortOpImpl() :
   inited_(false), local_merge_sort_(false), need_rewind_(false), got_first_row_(false),
   sorted_(false), enable_encode_sortkey_(false),
+  fts_term_rank_sort_(false), fts_word_key_(-1),
   page_allocator_("PartSortBucket", ObCtxIds::WORK_AREA), mem_context_(NULL),
   mem_entify_guard_(mem_context_), sort_collations_(nullptr),
   sort_cmp_funs_(nullptr), eval_ctx_(nullptr), datum_access_ctx_(nullptr),
@@ -579,6 +581,7 @@ ObSortOpImpl::ObSortOpImpl() :
 ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
   : inited_(false), local_merge_sort_(false), need_rewind_(false),
     got_first_row_(false), sorted_(false), enable_encode_sortkey_(false),
+    fts_term_rank_sort_(false), fts_word_key_(-1),
     page_allocator_("PartSortBucket", ObCtxIds::WORK_AREA), mem_context_(NULL),
     mem_entify_guard_(mem_context_), sort_collations_(nullptr),
     sort_cmp_funs_(nullptr), eval_ctx_(nullptr), datum_access_ctx_(nullptr),
@@ -858,6 +861,8 @@ void ObSortOpImpl::reset()
   datum_store_.reset();
   inmem_row_size_ = 0;
   local_merge_sort_ = false;
+  fts_term_rank_sort_ = false;
+  fts_word_key_ = -1;
   need_rewind_ = false;
   sorted_ = false;
   got_first_row_ = false;
@@ -1304,6 +1309,20 @@ int ObSortOpImpl::add_stored_row(const ObChunkDatumStore::StoredRow &input_row)
   if (OB_FAIL(before_add_row())) {
   } else if (OB_FAIL(datum_store_.add_row(input_row, &sr))) {
   } else if (OB_FAIL(after_add_row(sr))) {
+  }
+  return ret;
+}
+
+int ObSortOpImpl::add_fts_datums(const common::ObDatum *datums, const int64_t count)
+{
+  int ret = OB_SUCCESS;
+  ObChunkDatumStore::StoredRow *row = nullptr;
+  if (nullptr == datums || nullptr == sort_exprs_ || count != sort_exprs_->count()
+      || count < 4 || count > 5 || enable_encode_sortkey_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(before_add_row())) {
+  } else if (OB_FAIL(datum_store_.add_row(datums, count, 0, &row))) {
+  } else if (OB_FAIL(after_add_row(row))) {
   }
   return ret;
 }
@@ -1833,6 +1852,214 @@ int ObSortOpImpl::part_topn_heap_next(int64_t &cur_heap_idx,
   return ret;
 }
 
+// Raw-byte interning never decides collation equality. Distinct raw terms are
+// sorted by the plan's authoritative comparator, then equivalent terms share a
+// rank. Neither ranks nor borrowed datum pointers survive this one run.
+bool ObSortOpImpl::enable_fts_term_rank_sort()
+{
+  if (enable_encode_sortkey_ || local_merge_sort_ || use_heap_sort_
+      || use_partition_topn_sort_ || part_cnt_ != 0 || is_fetch_with_ties_
+      || nullptr == sort_exprs_ || nullptr == sort_collations_
+      || nullptr == sort_cmp_funs_ || sort_collations_->count() < 2
+      || sort_collations_->count() > 3 || comp_.cmp_start_ != 0
+      || comp_.cmp_end_ != sort_collations_->count()) return false;
+  bool eligible = sort_cmp_funs_->count() == sort_collations_->count();
+  int64_t strings = 0, parts = 0;
+  for (int64_t i = 0; eligible && i < sort_collations_->count(); ++i) {
+    const ObSortFieldCollation &c = sort_collations_->at(i);
+    eligible = c.field_idx_ < sort_exprs_->count();
+    for (int64_t j = 0; eligible && j < i; ++j) {
+      eligible = c.field_idx_ != sort_collations_->at(j).field_idx_;
+    }
+    const ObExpr *e = eligible ? sort_exprs_->at(c.field_idx_) : nullptr;
+    if (nullptr == e || e->obj_meta_.has_lob_header()
+        || nullptr == sort_cmp_funs_->at(i).cmp_func_) {
+      eligible = false;
+    } else if (e->datum_meta_.type_ == ObVarcharType) {
+      if (strings++ == 0) {
+        fts_word_key_ = i;
+      } else {
+        eligible = c.cs_type_ == CS_TYPE_BINARY && e->datum_meta_.cs_type_ == CS_TYPE_BINARY;
+      }
+    } else if (e->datum_meta_.type_ == ObIntType && e->type_ == T_PDML_PARTITION_ID) {
+      ++parts;
+    } else {
+      eligible = false;
+    }
+  }
+  fts_term_rank_sort_ = eligible && strings == 2 && parts <= 1;
+  return fts_term_rank_sort_;
+}
+
+int64_t ObSortOpImpl::fts_term_rank_scratch_size() const
+{
+  int64_t size = 0;
+  if (fts_term_rank_sort_ && nullptr != rows_ && rows_->count() > 0) {
+    const int64_t n = rows_->count();
+    const int64_t capacity = std::min(n, static_cast<int64_t>(4096));
+    int64_t buckets = 2;
+    while (buckets < 2 * capacity) buckets *= 2;
+    const int64_t dictionary = capacity * (sizeof(FtsRankTerm) + sizeof(FtsRankTerm *))
+        + buckets * sizeof(uint32_t) + ObChunkDatumStore::BLOCK_SIZE;
+    size = n > (INT64_MAX - dictionary) / sizeof(FtsRankRow)
+        ? INT64_MAX : n * sizeof(FtsRankRow) + dictionary;
+  }
+  return size;
+}
+
+int ObSortOpImpl::try_fts_term_rank_sort(bool &sorted)
+{
+  int ret = OB_SUCCESS;
+  sorted = false;
+  if (!fts_term_rank_sort_ || rows_->count() < 2) return ret;
+  const int64_t n = rows_->count();
+  const int64_t capacity = std::min(n, static_cast<int64_t>(4096));
+  int64_t buckets = 2;
+  while (buckets < 2 * capacity) buckets *= 2;
+  const int64_t reserve = fts_term_rank_scratch_size();
+  const int64_t data_bound = get_memory_limit();
+  const int64_t total_bound = profile_.get_max_bound();
+  const int64_t used_before = mem_context_->used();
+  // The original data target still controls spilling. Scratch plus all live
+  // allocations must fit the existing total grant; no grant policy is changed.
+  // A late batch, changed grant, or allocation failure still falls back.
+  if (reserve >= total_bound || used_before > total_bound - reserve) {
+    fts_term_rank_sort_ = false;
+    LOG_INFO("FTS term rank fallback", "reason", "budget", K(n), K(reserve),
+        K(data_bound), K(total_bound), K(used_before));
+    return ret;
+  }
+  const int64_t bytes = reserve - ObChunkDatumStore::BLOCK_SIZE;
+  void *scratch = mem_context_->get_malloc_allocator().alloc(bytes);
+  if (nullptr == scratch) {
+    fts_term_rank_sort_ = false;
+    LOG_INFO("FTS term rank fallback", "reason", "scratch allocation", K(n), K(reserve));
+    return ret;
+  }
+  FtsRankRow *items = static_cast<FtsRankRow *>(scratch);
+  FtsRankTerm *terms = reinterpret_cast<FtsRankTerm *>(items + n);
+  FtsRankTerm **order = reinterpret_cast<FtsRankTerm **>(terms + capacity);
+  uint32_t *slots = reinterpret_cast<uint32_t *>(order + capacity);
+  MEMSET(slots, 0, buckets * sizeof(*slots));
+  const ObSortFieldCollation &word_c = sort_collations_->at(fts_word_key_);
+  const ObDatumCmpFuncType word_cmp = sort_cmp_funs_->at(fts_word_key_).cmp_func_;
+  int64_t unique = 0;
+  const int64_t used_after_alloc = mem_context_->used();
+  const int64_t bound_after_alloc = std::min(total_bound, profile_.get_max_bound());
+  bool eligible = used_after_alloc <= bound_after_alloc;
+  const char *reason = eligible ? "datum or unique limit" : "allocation budget";
+  // Preflight and interning do not modify rows_. Raw strings reference pinned
+  // StoredRow storage, not the tokenizer's reusable document arena.
+  for (int64_t i = 0; OB_SUCC(ret) && eligible && i < n; ++i) {
+    if (OB_FAIL(comp_.fast_check_status())) {
+    } else {
+      const ObChunkDatumStore::StoredRow *row = rows_->at(i);
+      for (int64_t j = 0; eligible && j < sort_collations_->count(); ++j) {
+        const ObSortFieldCollation &c = sort_collations_->at(j);
+        if (nullptr == row || c.field_idx_ >= row->cnt_) {
+          eligible = false;
+        } else {
+          const ObDatum &d = row->cells()[c.field_idx_];
+          eligible = !d.is_null() && d.flag_ == ObDatum::NONE && nullptr != d.ptr_;
+          if (eligible && j != fts_word_key_) {
+            const bool doc = sort_exprs_->at(c.field_idx_)->datum_meta_.type_ == ObVarcharType;
+            eligible = d.len_ == (doc ? OB_DOC_ID_COLUMN_BYTE_LENGTH : 8);
+          }
+        }
+      }
+      if (eligible) {
+        const ObDatum &word = row->cells()[word_c.field_idx_];
+        uint64_t bucket = ObString(word.len_, word.ptr_).hash() & (buckets - 1);
+        while (OB_SUCC(ret) && slots[bucket] != 0) {
+          if (OB_FAIL(comp_.fast_check_status())) break;
+          const ObDatum &other = *terms[slots[bucket] - 1].word_;
+          if (word.len_ == other.len_ && 0 == MEMCMP(word.ptr_, other.ptr_, word.len_)) break;
+          bucket = (bucket + 1) & (buckets - 1);
+        }
+        if (OB_SUCCESS != ret) {
+        } else if (slots[bucket] == 0) {
+          if (unique == capacity) {
+            eligible = false;
+            fts_term_rank_sort_ = false;
+            reason = "unique limit";
+          } else {
+            int64_t well_formed = 0;
+            // Malformed multibyte input can trigger pair-dependent binary
+            // suffix fallback. Preserve the original whole-run comparator.
+            if (word_c.cs_type_ != CS_TYPE_BINARY
+                && (OB_SUCCESS != ObCharset::well_formed_len(word_c.cs_type_, word.ptr_,
+                    word.len_, well_formed) || well_formed != word.len_)) {
+              eligible = false;
+            } else {
+              terms[unique].word_ = &word;
+              terms[unique].rank_ = 0;
+              order[unique] = &terms[unique];
+              slots[bucket] = static_cast<uint32_t>(++unique);
+            }
+          }
+        }
+        if (OB_SUCC(ret) && eligible) {
+          items[i].row_ = rows_->at(i);
+          items[i].term_ = slots[bucket] - 1;
+        }
+      }
+    }
+  }
+  if (!eligible) fts_term_rank_sort_ = false;
+  if (OB_SUCC(ret) && eligible && unique > n / 4) {
+    eligible = false;
+    fts_term_rank_sort_ = false; // low repetition: retain the original path thereafter
+    reason = "low repetition";
+  }
+  if (OB_SUCC(ret) && eligible
+      && OB_SUCC(ret = sql_mem_processor_.update_used_mem_size(mem_context_->used()))) {
+    auto less_word = [&](const FtsRankTerm *l, const FtsRankTerm *r) {
+      if (OB_SUCCESS != ret || OB_FAIL(comp_.fast_check_status())) return l < r;
+      int cmp = 0;
+      if (OB_FAIL(word_cmp(*l->word_, *r->word_, cmp, datum_access_ctx_))) return l < r;
+      return cmp < 0;
+    };
+    lib::ob_sort(order, order + unique, less_word);
+    uint64_t rank = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < unique; ++i) {
+      int cmp = 0;
+      if (i > 0 && OB_FAIL(word_cmp(*order[i-1]->word_, *order[i]->word_, cmp, datum_access_ctx_))) {
+      } else {
+        if (cmp != 0) ++rank;
+        order[i]->rank_ = rank;
+      }
+    }
+    auto less_row = [&](const FtsRankRow &l, const FtsRankRow &r) {
+      if (OB_SUCCESS != ret || OB_FAIL(comp_.fast_check_status())) return l.row_ < r.row_;
+      int cmp = 0;
+      for (int64_t j = 0; OB_SUCC(ret) && cmp == 0 && j < sort_collations_->count(); ++j) {
+        const ObSortFieldCollation &c = sort_collations_->at(j);
+        if (j == fts_word_key_) {
+          const uint64_t a = terms[l.term_].rank_, b = terms[r.term_].rank_;
+          cmp = a < b ? -1 : (a > b ? 1 : 0);
+        } else if (OB_FAIL(sort_cmp_funs_->at(j).cmp_func_(l.row_->cells()[c.field_idx_],
+                    r.row_->cells()[c.field_idx_], cmp, datum_access_ctx_))) {
+          return l.row_ < r.row_;
+        }
+        if (cmp != 0) return c.is_ascending_ ? cmp < 0 : cmp > 0;
+      }
+      return false;
+    };
+    if (OB_SUCC(ret)) lib::ob_sort(items, items + n, less_row);
+    if (OB_SUCC(ret) && OB_SUCC(ret = exec_ctx_->check_status())) {
+      for (int64_t i = 0; i < n; ++i) rows_->at(i) = items[i].row_;
+      sorted = true;
+      reason = "ranked";
+    }
+  }
+  mem_context_->get_malloc_allocator().free(scratch);
+  const int update_ret = sql_mem_processor_.update_used_mem_size(mem_context_->used());
+  if (OB_SUCC(ret)) ret = update_ret;
+  LOG_INFO("FTS run-local term rank sort", K(sorted), K(reason), K(n), K(unique), K(reserve),
+      K(data_bound), K(total_bound), K(used_before), K(used_after_alloc), K(bound_after_alloc));
+  return ret;
+}
+
 int ObSortOpImpl::sort_inmem_data()
 {
   int ret = OB_SUCCESS;
@@ -1862,7 +2089,11 @@ int ObSortOpImpl::sort_inmem_data()
           lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
         }
       } else {
-        lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+        bool rank_sorted = false;
+        if (OB_FAIL(try_fts_term_rank_sort(rank_sorted))) {
+        } else if (!rank_sorted) {
+          lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+        }
       }
       if (OB_SUCCESS != comp_.ret_) {
         ret = comp_.ret_;

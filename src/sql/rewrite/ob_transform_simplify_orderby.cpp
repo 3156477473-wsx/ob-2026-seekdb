@@ -40,6 +40,78 @@ using namespace oceanbase::sql;
 * ==>
 * select c1 from t1 where c2 in (select c2 from t2);
 */
+bool ObTransformSimplifyOrderby::is_count_over_limited_fts_view(const ObDMLStmt &stmt)
+{
+  bool valid = false;
+  if (stmt.is_select_stmt()) {
+    const ObSelectStmt &outer = static_cast<const ObSelectStmt &>(stmt);
+    auto is_simple_block = [](const ObSelectStmt &s) {
+      return s.is_single_table_stmt() && !s.get_from_item(0).is_joined_
+          && !s.is_set_stmt() && !s.has_distinct() && !s.has_having()
+          && !s.has_window_function() && !s.has_window_function_filter()
+          && !s.has_for_update() && !s.has_select_into() && !s.is_calc_found_rows()
+          && !s.is_contains_assignment() && s.get_subquery_expr_size() == 0
+          && s.get_semi_info_size() == 0 && s.get_cte_definition_size() == 0
+          && s.get_pseudo_column_like_exprs().empty()
+          && s.get_stmt_hint().get_no_rewrite_hint() == nullptr;
+    };
+    const TableItem *view = outer.get_table_size() == 1 ? outer.get_table_item(0) : nullptr;
+    if (is_simple_block(outer) && !outer.has_limit() && !outer.has_order_by()
+        && outer.get_condition_exprs().empty() && outer.get_match_exprs().empty()
+        && outer.is_scala_group_by() && outer.get_aggr_item_size() == 1
+        && outer.get_select_item_size() == 1 && view != nullptr
+        && view->is_generated_table() && !view->is_view_table_
+        && view->cte_type_ == TableItem::NOT_CTE && view->exec_params_.empty()
+        && view->ref_query_ != nullptr
+        && outer.get_from_item(0).table_id_ == view->table_id_) {
+      const ObAggFunRawExpr *count = outer.get_aggr_item(0);
+      const ObSelectStmt &inner = *view->ref_query_;
+      const TableItem *base = inner.get_table_size() == 1 ? inner.get_table_item(0) : nullptr;
+      if (count != nullptr && count == outer.get_select_item(0).expr_
+          && count->get_expr_type() == T_FUN_COUNT && !count->is_param_distinct()
+          && count->get_real_param_count() == 0 && count->get_param_count() == 0
+          && is_simple_block(inner) && !inner.has_group_by()
+          && inner.get_select_item_size() == 1 && inner.get_condition_exprs().count() == 1
+          && inner.get_match_exprs().count() == 1 && inner.get_order_item_size() == 1
+          && inner.get_limit_expr() != nullptr && inner.get_limit_expr()->is_const_raw_expr()
+          && !inner.get_limit_expr()->has_flag(CNT_DYNAMIC_PARAM)
+          && inner.get_offset_expr() == nullptr && inner.get_limit_percent_expr() == nullptr
+          && !inner.has_fetch() && !inner.is_fetch_with_ties()
+          && base != nullptr && base->is_basic_table() && !base->is_view_table_
+          && !base->is_system_table_ && !base->is_index_table_
+          && base->cte_type_ == TableItem::NOT_CTE && base->exec_params_.empty()
+          && base->sample_info_ == nullptr && base->snapshot_query_expr_ == nullptr
+          && inner.get_from_item(0).table_id_ == base->table_id_) {
+        const ObRawExpr *output = inner.get_select_item(0).expr_;
+        const ObRawExpr *match_expr = inner.get_match_exprs().at(0);
+        const ObRawExpr *filter = inner.get_condition_exprs().at(0);
+        if (output != nullptr && output->is_column_ref_expr()
+            && static_cast<const ObColumnRefRawExpr *>(output)->get_table_id() == base->table_id_
+            && !static_cast<const ObColumnRefRawExpr *>(output)->is_generated_column()
+            && match_expr != nullptr && match_expr->get_expr_class() == ObRawExpr::EXPR_MATCH_AGAINST
+            && filter != nullptr
+            && (filter == match_expr || (filter->get_expr_type() == T_OP_BOOL
+                && filter->get_param_count() == 1 && filter->get_param_expr(0) == match_expr))
+            && inner.get_order_item(0).expr_ == match_expr
+            && inner.get_order_item(0).order_type_ == default_desc_direction()) {
+          const ObMatchFunRawExpr *match = static_cast<const ObMatchFunRawExpr *>(match_expr);
+          const ObRawExpr *key = match->get_search_key();
+          valid = !match->is_es_match() && !match->get_match_columns().empty()
+              && match->get_columns_boosts().empty() && match->get_param_text_expr() == nullptr
+              && key != nullptr && key->is_const_raw_expr() && !key->has_flag(CNT_DYNAMIC_PARAM);
+          for (int64_t i = 0; valid && i < match->get_match_columns().count(); ++i) {
+            const ObRawExpr *column = match->get_match_columns().at(i);
+            valid = column != nullptr && column->is_column_ref_expr()
+                && static_cast<const ObColumnRefRawExpr *>(column)->get_table_id() == base->table_id_
+                && !static_cast<const ObColumnRefRawExpr *>(column)->is_generated_column();
+          }
+        }
+      }
+    }
+  }
+  return valid;
+}
+
 int ObTransformSimplifyOrderby::transform_one_stmt(common::ObIArray<ObParentDMLStmt> &parent_stmts,
                                                    ObDMLStmt *&stmt,
                                                    bool &trans_happened)
@@ -138,8 +210,9 @@ int ObTransformSimplifyOrderby::remove_order_by_for_view_stmt(ObDMLStmt *stmt, b
       } else if (1 == table_items.count()) {
         if (stmt->is_select_stmt()) {
           select_stmt = static_cast<ObSelectStmt*>(stmt);
-          if ((select_stmt->has_group_by() || select_stmt->has_distinct() ||
-                     select_stmt->has_order_by()) && !view_stmt->has_limit() &&
+          if ((((select_stmt->has_group_by() || select_stmt->has_distinct() ||
+                     select_stmt->has_order_by()) && !view_stmt->has_limit()) ||
+                     is_count_over_limited_fts_view(*select_stmt)) &&
                      view_stmt->has_order_by() &&
                      OB_FAIL(do_remove_stmt_order_by(view_stmt, happened))) {
           } else {

@@ -78,6 +78,74 @@ int ObCompactBlockReader::get_row(const ObChunkDatumStore::StoredRow *&sr)
 
 
 
+// This view is private to FTS prescan replay. It never masquerades as a
+// contiguous StoredRow: its value pointers refer to the pinned compact block.
+int ObCompactBlockReader::peek_fts_datums(ObDatum *datums, const int64_t count, int64_t &row_size)
+{
+  int ret = OB_SUCCESS;
+  row_size = 0;
+  if (nullptr == cur_blk_ || nullptr == row_meta_) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!blk_has_next_row()) {
+    ret = OB_ITER_END;
+  } else if (nullptr == datums || count < 4 || count > 5 || row_meta_->col_cnt_ != count
+      || row_meta_->extra_size_ != 0 || row_meta_->fixed_cnt_ != count - 2
+      || row_meta_->var_data_off_ != (count - 2) * 8
+      || row_meta_->column_length_.count() != count || row_meta_->column_offset_.count() != count) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    const int64_t bitmap_size = ObBitVector::memory_size(count);
+    const int64_t data_offset = HEAD_SIZE + bitmap_size + 3 * BASE_OFFSET_SIZE;
+    const int64_t payload_size = cur_blk_->raw_size_ - static_cast<int64_t>(sizeof(ObTempBlockStore::Block));
+    if (cur_pos_in_blk_ < 0 || payload_size < HEAD_SIZE || cur_pos_in_blk_ > payload_size - HEAD_SIZE) {
+      ret = OB_INDEX_OUT_OF_RANGE;
+    } else {
+      const char *row = cur_blk_->payload_ + cur_pos_in_blk_;
+      uint32_t stored_size = 0;
+      uint8_t width = 0;
+      MEMCPY(&stored_size, row, sizeof(stored_size));
+      MEMCPY(&width, row + sizeof(stored_size), sizeof(width));
+      if (stored_size < HEAD_SIZE || stored_size > payload_size - cur_pos_in_blk_) {
+        ret = OB_INDEX_OUT_OF_RANGE;
+      } else if (width == EXTENDED_OFFSET_SIZE) {
+        ret = OB_NOT_SUPPORTED;
+      } else if (width != BASE_OFFSET_SIZE || bitmap_size != sizeof(uint64_t)
+          || stored_size < data_offset + row_meta_->var_data_off_) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        uint64_t nulls = 0;
+        uint16_t offsets[3];
+        MEMCPY(&nulls, row + HEAD_SIZE, sizeof(nulls));
+        MEMCPY(offsets, row + HEAD_SIZE + bitmap_size, sizeof(offsets));
+        if ((nulls & ((1ULL << count) - 1)) != 0) {
+          ret = OB_NOT_SUPPORTED;
+        } else if (offsets[0] != row_meta_->var_data_off_ || offsets[0] > offsets[1]
+            || offsets[1] > offsets[2] || offsets[2] != stored_size - data_offset) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          int64_t var_col = 0;
+          for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+            const int64_t length = row_meta_->column_length_[i];
+            const int64_t offset = row_meta_->column_offset_[i];
+            if (length == 0 && var_col < 2) {
+              datums[i].pack_ = offsets[var_col + 1] - offsets[var_col];
+              datums[i].ptr_ = row + data_offset + offsets[var_col++];
+            } else if (length == 8 && offset >= 0 && offset <= row_meta_->var_data_off_ - 8) {
+              datums[i].pack_ = 8;
+              datums[i].ptr_ = row + data_offset + offset;
+            } else {
+              ret = OB_NOT_SUPPORTED;
+            }
+          }
+          if (OB_SUCC(ret) && var_col != 2) ret = OB_NOT_SUPPORTED;
+          if (OB_SUCC(ret)) row_size = stored_size;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 template <typename T>
 int ObCompactBlockReader::get_stored_row(ObChunkDatumStore::StoredRow *&sr)
 {

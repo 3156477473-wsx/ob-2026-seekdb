@@ -132,6 +132,16 @@ public:
   }
 
   int get_row(const ObChunkDatumStore::StoredRow *&sr) override;
+  // Borrow only until the next source operation; the caller must deep-copy
+  // before consume_fts_row. Unsupported layouts leave the cursor untouched.
+  int peek_fts_datums(common::ObDatum *datums, const int64_t count, int64_t &row_size);
+  bool has_fts_row() { return blk_has_next_row(); }
+  void consume_fts_row(const int64_t row_size)
+  {
+    OB_ASSERT(row_size > 0 && blk_has_next_row());
+    cur_pos_in_blk_ += row_size;
+    ++cur_row_in_blk_;
+  }
 
   void set_meta(const ChunkRowMeta *row_meta) { row_meta_ = row_meta; };
   const ChunkRowMeta *get_meta() { return row_meta_; }

@@ -1592,6 +1592,18 @@ int ObSSTableIndexBuilder::do_check_and_rewrite_sstable(ObBlockInfo &block_info)
 
   if (OB_FAIL(get_single_macro_meta(row_allocator_, index_block_loader_,
           container_store_desc_, roots_, macro_meta))) {
+  } else if (macro_meta.val_.occupy_size_ >= SMALL_SSTABLE_THRESHOLD
+             && macro_meta.val_.occupy_size_ <= macro_block_size) {
+    // occupy_size is the physical data prefix after stored micro-block bytes,
+    // including their headers. Leaf/meta blocks are appended after that prefix,
+    // so their aligned end cannot fit the strictly smaller shared-block limit.
+    // Preserve load_single_macro_block's device fsync and error propagation:
+    // the later builder fsync may be a no-op for array/in-memory metadata.
+    if (OB_FAIL(LOCAL_DEVICE_INSTANCE.fsync_block())) {
+    } else {
+      STORAGE_LOG(INFO, "skip ineligible small sstable read",
+          K(macro_meta.val_.occupy_size_), K(macro_block_size));
+    }
   } else if (OB_FAIL(load_single_macro_block(
                  macro_meta, macro_block_size, 0, self_allocator_, data_buf))) {
   } else if (OB_FAIL(parse_macro_header(data_buf, macro_block_size, macro_header))) {

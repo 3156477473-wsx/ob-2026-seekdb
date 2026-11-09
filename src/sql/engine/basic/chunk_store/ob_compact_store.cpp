@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_compact_store.h"
 #include "sql/engine/basic/chunk_store/ob_compact_block_writer.h"
+#include "sql/engine/basic/chunk_store/ob_compact_block_reader.h"
 
 namespace oceanbase
 {
@@ -103,6 +104,49 @@ int ObCompactStore::inner_get_next_row(const ObChunkDatumStore::StoredRow *&sr)
     ret = OB_ERR_UNEXPECTED;
   }
   return ret;
+}
+
+int ObCompactStore::peek_fts_datums(common::ObDatum *datums, const int64_t count,
+                                    int64_t &row_size, bool &supported)
+{
+  int ret = OB_SUCCESS;
+  supported = false;
+  row_size = 0;
+  ObCompactBlockReader *reader = static_cast<ObCompactBlockReader *>(reader_);
+  const ObTempBlockStore::Block *block = nullptr;
+  if (!inited_ || nullptr == reader) {
+    ret = OB_NOT_INIT;
+  } else if (reader->get_meta() != &row_meta_) {
+    // set_meta callers keep their original reader path.
+  } else {
+    if (!start_iter_) cur_blk_id_ = 0;
+    if (!start_iter_ || !reader->has_fts_row()) {
+      if (cur_blk_id_ >= get_block_id_cnt()) {
+        ret = OB_ITER_END;
+      } else if (OB_FAIL(block_reader_.get_block(cur_blk_id_, block))) {
+      } else {
+        reader->reuse();
+        reader->set_block(block);
+        start_iter_ = true;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = reader->peek_fts_datums(datums, count, row_size);
+      if (ret == OB_NOT_SUPPORTED) {
+        ret = OB_SUCCESS; // neither reader nor store row cursor moved
+      } else if (OB_SUCC(ret)) {
+        supported = true;
+      }
+    }
+  }
+  return ret;
+}
+
+void ObCompactStore::consume_fts_row(const int64_t row_size)
+{
+  OB_ASSERT(inited_ && start_iter_ && nullptr != reader_ && row_size > 0);
+  static_cast<ObCompactBlockReader *>(reader_)->consume_fts_row(row_size);
+  ++cur_blk_id_;
 }
 
 int ObCompactStore::inner_add_batch(const common::ObDatum **datums, const common::ObIArray<ObExpr *> &exprs,

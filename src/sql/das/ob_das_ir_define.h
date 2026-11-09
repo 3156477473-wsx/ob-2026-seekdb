@@ -83,7 +83,7 @@ public:
       avg_doc_len_est_spec_(alloc),
       mode_flag_(NATURAL_LANGUAGE_MODE),
       flags_(0),
-      field_boost_expr_(nullptr) {}
+      field_boost_expr_(nullptr), union_count_output_(nullptr) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
@@ -195,6 +195,8 @@ public:
     };
   };
   ObExpr *field_boost_expr_;
+  // Real aggregate result after visible postings union, never a domain ID.
+  ObExpr *union_count_output_;
 };
 
 struct ObDASIRScanRtDef : ObDASAttachRtDef

@@ -106,6 +106,7 @@ private:
   int gen_inv_idx_scan_default_range(const ObString &query_token, ObNewRange &scan_range);
   int gen_inv_idx_scan_one_range(const ObString &query_token, const ObDocIdExt &doc_id, ObNewRange &scan_range);
   int init_topk_limit();
+  int get_next_union_count_row();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
 private:
@@ -149,6 +150,7 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
+  bool union_count_emitted_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };
 

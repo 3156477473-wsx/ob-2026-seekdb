@@ -37,7 +37,7 @@ struct ObTextDaaTParam
   ObTextDaaTParam()
     : dim_iters_(nullptr), base_param_(nullptr), allocator_(nullptr), relevance_collector_(nullptr),
       bm25_param_est_ctx_(), mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), minimum_should_match_(-1) {}
   ~ObTextDaaTParam() {}
   TO_STRING_KV(K_(base_param), KP_(dim_iters), K_(bm25_param_est_ctx),  K_(mode_flag), K_(function_lookup_mode));
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;
@@ -47,6 +47,9 @@ struct ObTextDaaTParam
   ObBM25ParamEstCtx bm25_param_est_ctx_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  // A nonnegative value opts in to the legacy natural-language membership contract.
+  // Other builders retain the generic collector/heap path by default.
+  int64_t minimum_should_match_;
 };
 
 class ObTextDaaTIter final : public ObSRDaaTIterImpl
@@ -55,10 +58,15 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false),
+      minimum_should_match_(-1), bulk_union_enabled_(false),
+      bulk_union_cmp_(nullptr), bulk_union_eof_() {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
+  // supported=false never consumes input; real failures never request fallback.
+  int try_count_all(int64_t &total, bool &supported);
+  virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
 protected:
@@ -68,6 +76,15 @@ protected:
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
 private:
+  static const int64_t BULK_UNION_MAX_FANOUT = 4;
+  bool can_use_bulk_union() const;
+  int merge_owned_doc_id_spans(const int64_t capacity, int64_t &count, const bool count_only = false);
+  int find_bulk_prefix(const ObDocIdExt *ids, const int64_t size,
+                       const ObDatum *upper_bound, int64_t &prefix) const;
+  int64_t minimum_should_match_;
+  bool bulk_union_enabled_;
+  common::ObDatumCmpFuncType bulk_union_cmp_;
+  bool bulk_union_eof_[BULK_UNION_MAX_FANOUT];
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };
 

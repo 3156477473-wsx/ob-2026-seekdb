@@ -115,6 +115,89 @@ struct ObFilterTSC
 {
 };
 
+namespace
+{
+// Certify the complete tree before PX serialization cuts it at RECEIVE.
+// A worker-local subtree cannot prove absence of another upstream sort/DFO.
+void certify_fts_single_pass_plan(const ObLogPlan &log_plan, ObPhysicalPlan &plan, ObOpSpec *root)
+{
+  if (plan.get_ddl_task_id() <= 0) return;
+  if (plan.get_px_dop() != 1 || plan.get_is_use_auto_dop()) {
+    LOG_INFO("FTS single-pass plan degree declined", "max_dop", plan.get_px_dop(),
+        "auto_dop", plan.get_is_use_auto_dop());
+    return;
+  }
+  const ObPhyOperatorType expected[] = {PHY_PX_FIFO_COORD, PHY_PX_REDUCE_TRANSMIT,
+      PHY_PX_MULTI_PART_SSTABLE_INSERT, PHY_SORT, PHY_PX_FIFO_RECEIVE,
+      PHY_PX_DIST_TRANSMIT, PHY_STAT_COLLECTOR, PHY_SUBPLAN_SCAN, PHY_ROW_SAMPLE_SCAN};
+  ObOpSpec *nodes[9] = {};
+  ObOpSpec *cur = root;
+  for (int64_t i = 0; i < 9; ++i) {
+    if (nullptr == cur || (cur->type_ != expected[i]
+        && !(i == 1 && cur->type_ == PHY_PX_DIST_TRANSMIT))
+        || cur->get_child_cnt() != (i == 8 ? 0 : 1)
+        || !cur->filters_.empty() || !cur->startup_filters_.empty()) {
+      LOG_INFO("FTS single-pass plan topology declined", K(i),
+          "actual_type", nullptr == cur ? -1 : static_cast<int64_t>(cur->type_),
+          "children", nullptr == cur ? -1 : static_cast<int64_t>(cur->get_child_cnt()));
+      return;
+    }
+    nodes[i] = cur;
+    cur = i == 8 ? nullptr : cur->get_child(0);
+  }
+  const ObPxTransmitSpec &outer = *static_cast<ObPxTransmitSpec *>(nodes[1]);
+  const ObPxTransmitSpec &inner = *static_cast<ObPxTransmitSpec *>(nodes[5]);
+  const ObStatCollectorSpec &stat = *static_cast<ObStatCollectorSpec *>(nodes[6]);
+  const ObTableScanSpec &scan = *static_cast<ObTableScanSpec *>(nodes[8]);
+  ObSortSpec &sort = *static_cast<ObSortSpec *>(nodes[3]);
+  // part_level_ is only populated for partition-range pruning. A whole-table
+  // scan may keep PARTITION_LEVEL_MAX even for an unpartitioned table. Certify
+  // the real source schema instead of interpreting that sentinel as a level.
+  ObExecContext *exec_ctx = log_plan.get_optimizer_context().get_exec_ctx();
+  const share::schema::ObTableSchema *source_schema = nullptr;
+  const share::schema::ObTableSchema *target_schema = nullptr;
+  if (nullptr == exec_ctx || nullptr == exec_ctx->get_sql_ctx()
+      || nullptr == exec_ctx->get_sql_ctx()->schema_guard_
+      || OB_SUCCESS != exec_ctx->get_sql_ctx()->schema_guard_->get_table_schema(
+          plan.get_ddl_table_id(), target_schema)
+      || nullptr == target_schema || !target_schema->is_valid()
+      || (!target_schema->is_fts_index_aux() && !target_schema->is_fts_doc_word_aux())
+      || scan.get_ref_table_id() != target_schema->get_data_table_id()
+      || OB_SUCCESS != exec_ctx->get_sql_ctx()->schema_guard_->get_table_schema(
+          scan.get_ref_table_id(), source_schema)
+      || nullptr == source_schema || !source_schema->is_valid()
+      || source_schema->get_part_level() != share::schema::PARTITION_LEVEL_ZERO) {
+    LOG_INFO("FTS single-pass plan source schema declined", "source_table_id", scan.get_ref_table_id(),
+        "ddl_table_id", plan.get_ddl_table_id(), "scan_partition_level", scan.part_level_);
+    return;
+  }
+  if (outer.get_px_dop() != 1 || inner.get_px_dop() != 1
+      || outer.get_split_task_count() != 1 || inner.get_split_task_count() != 1
+      || outer.is_slave_mapping() || inner.is_slave_mapping()
+      || outer.dist_method_ != ObPQDistributeMethod::LOCAL
+      || inner.dist_method_ != ObPQDistributeMethod::RANGE
+      || inner.sample_type_ != ObPxSampleType::OBJECT_SAMPLE
+      || stat.type_ != ObStatCollectorType::SAMPLE_SORT || !stat.is_none_partition_
+      || nullptr != scan.limit_ || nullptr != scan.offset_
+      || !sort.prescan_enabled_ || sort.enable_encode_sortkey_opt_
+      || sort.prefix_pos_ != 0 || sort.part_cnt_ != 0 || sort.is_local_merge_sort_
+      || sort.is_fetch_with_ties_ || nullptr != sort.topn_expr_
+      || nullptr != sort.topk_limit_expr_ || nullptr != sort.topk_offset_expr_
+      || sort.enable_pd_topn_filter()) {
+    LOG_INFO("FTS single-pass plan options declined", "outer_dop", outer.get_px_dop(),
+        "inner_dop", inner.get_px_dop(), "outer_split", outer.get_split_task_count(),
+        "inner_split", inner.get_split_task_count(), "outer_dist", outer.dist_method_,
+        "inner_dist", inner.dist_method_, "sample_type", inner.sample_type_,
+        "stat_type", stat.type_, "none_partition", stat.is_none_partition_,
+        "scan_partition_level", scan.part_level_);
+    return;
+  }
+  sort.fts_single_pass_plan_ = true;
+  LOG_INFO("FTS single-pass plan certified", "source_table_id", scan.get_ref_table_id(),
+      "schema_partition_level", source_schema->get_part_level(), "scan_partition_level", scan.part_level_);
+}
+} // namespace
+
 int ObStaticEngineCG::generate(const ObLogPlan &log_plan, ObPhysicalPlan &phy_plan)
 {
   int ret = OB_SUCCESS;
@@ -152,6 +235,8 @@ int ObStaticEngineCG::generate(const ObLogPlan &log_plan, ObPhysicalPlan &phy_pl
     phy_plan.set_root_op_spec(root_spec);
     phy_plan.set_is_use_auto_dop(opt_ctx_->is_use_auto_dop());
     if (OB_FAIL(set_properties_post(log_plan, phy_plan))) {
+    } else {
+      certify_fts_single_pass_plan(log_plan, phy_plan, root_spec);
     }
   }
   return ret;
@@ -783,10 +868,119 @@ int ObStaticEngineCG::generate_spec_final(ObLogicalOperator &op, ObOpSpec &spec)
     ObTableScanSpec &tsc_spec = static_cast<ObTableScanSpec&>(spec);
     ObDASScanCtDef &scan_ctdef = tsc_spec.tsc_ctdef_.scan_ctdef_;
     ObDASScanCtDef *lookup_ctdef = tsc_spec.tsc_ctdef_.lookup_ctdef_;
-    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+    const ObDASBaseCtDef *fts_source = tsc_spec.tsc_ctdef_.attach_spec_.attach_ctdef_;
+    bool scalar_fts_source = nullptr == fts_source;
+    if (tsc_spec.is_fts_ddl_ && nullptr != fts_source
+        && DAS_OP_DOMAIN_ID_MERGE == fts_source->op_type_) {
+      // Ordinary FTS DDL reads a document and its generated document ID through
+      // this merge. Both child scans stay scalar; only the cached terms above
+      // that source are batched. Other attached operators keep the fallback.
+      const ObDASDomainIdMergeCtDef *domain_source =
+          static_cast<const ObDASDomainIdMergeCtDef *>(fts_source);
+      scalar_fts_source = 2 == domain_source->children_cnt_
+          && nullptr != domain_source->children_
+          && &scan_ctdef == domain_source->children_[0]
+          && nullptr != domain_source->children_[1]
+          && DAS_OP_TABLE_SCAN == domain_source->children_[1]->op_type_
+          && 1 == domain_source->domain_types_.count()
+          && share::ObDomainIdUtils::ObDomainIDType::DOC_ID == domain_source->domain_types_.at(0);
+    }
+    if (tsc_spec.is_fts_ddl_) {
+      LOG_INFO("FTS DDL batch eligibility", "plan_batch_size", phy_plan_->get_batch_size(),
+               "scan_type", tsc_spec.type_,
+               K(scalar_fts_source), "output_count", tsc_spec.output_.count(),
+               "resumable", static_cast<bool>(tsc_spec.is_scan_resumable_),
+               "batch_scan", static_cast<bool>(tsc_spec.batch_scan_flag_),
+               "has_lookup", nullptr != lookup_ctdef,
+               "has_dppr", nullptr != tsc_spec.tsc_ctdef_.das_dppr_tbl_,
+               "spatial", tsc_spec.is_spatial_ddl(),
+               "multivalue", tsc_spec.is_multivalue_ddl(),
+               "spiv", tsc_spec.is_spiv_ddl(),
+               "index_merge", static_cast<bool>(tsc_spec.tsc_ctdef_.use_index_merge_),
+               "bnlj_parameters", tsc_spec.tsc_ctdef_.bnlj_param_idxs_.count(),
+               "inverted_aux", static_cast<bool>(tsc_spec.is_fts_index_aux_),
+               "filter_count", tsc_spec.filters_.count(),
+               "startup_count", tsc_spec.startup_filters_.count());
+      for (int64_t i = 0; i < tsc_spec.output_.count(); ++i) {
+        const ObExpr *expr = tsc_spec.output_.at(i);
+        if (nullptr != expr) {
+          LOG_INFO("FTS DDL batch expression", K(i), "type", expr->type_,
+                   "batch_result", expr->is_batch_result(),
+                   "partition", expr == tsc_spec.pdml_partition_id_);
+        }
+      }
+    }
+    // Batch only the expanded terms of one cached document. The source
+    // document scan remains scalar, including its DAS/pushdown expression mode.
+    // FTS DDL can retain a row or DDL-block sample operator after sampling.
+    // Both delegate to ObTableScanOp, which preserves scalar sampling and
+    // batches terms only once the existing rescan disables sample_info_.
+    if ((PHY_TABLE_SCAN == tsc_spec.type_ || PHY_ROW_SAMPLE_SCAN == tsc_spec.type_
+         || PHY_DDL_BLOCK_SAMPLE_SCAN == tsc_spec.type_)
+        && tsc_spec.is_fts_ddl_
+        && phy_plan_->get_batch_size() > 1
+        && !tsc_spec.is_spatial_ddl() && !tsc_spec.is_multivalue_ddl()
+        && !tsc_spec.is_spiv_ddl() && !tsc_spec.is_scan_resumable_
+        && !tsc_spec.batch_scan_flag_
+        && nullptr == lookup_ctdef
+        && scalar_fts_source
+        && nullptr == tsc_spec.tsc_ctdef_.das_dppr_tbl_
+        && !tsc_spec.tsc_ctdef_.use_index_merge_
+        && tsc_spec.tsc_ctdef_.bnlj_param_idxs_.empty()
+        && tsc_spec.filters_.empty() && tsc_spec.startup_filters_.empty()
+        && (tsc_spec.output_.count() == 4 || tsc_spec.output_.count() == 5)) {
+      ObExpr *fts_cols[4] = {nullptr, nullptr, nullptr, nullptr};
+      int64_t word_idx = -1;
+      bool can_batch = true;
+      for (int64_t i = 0; can_batch && i < tsc_spec.output_.count(); ++i) {
+        ObExpr *expr = tsc_spec.output_.at(i);
+        if (nullptr == expr) {
+          can_batch = false;
+        } else if (T_FUN_SYS_WORD_SEGMENT == expr->type_) {
+          can_batch = word_idx == -1;
+          word_idx = i;
+          fts_cols[0] = expr;
+        } else if (T_FUN_SYS_WORD_COUNT == expr->type_) {
+          fts_cols[2] = expr;
+        } else if (T_FUN_SYS_DOC_LENGTH == expr->type_) {
+          fts_cols[3] = expr;
+        }
+      }
+      const int64_t doc_idx = word_idx + (tsc_spec.is_fts_index_aux_ ? 1 : -1);
+      if (word_idx < 0 || doc_idx < 0 || doc_idx >= tsc_spec.output_.count()) {
+        can_batch = false;
+      } else {
+        fts_cols[1] = tsc_spec.output_.at(doc_idx);
+      }
+      for (int64_t i = 0; can_batch && i < 4; ++i) {
+        // A late operator override must never invent expression frame slots.
+        can_batch = nullptr != fts_cols[i] && fts_cols[i]->is_batch_result();
+        for (int64_t j = 0; can_batch && j < i; ++j) {
+          can_batch = fts_cols[i] != fts_cols[j];
+        }
+      }
+      int64_t partition_cols = 0;
+      for (int64_t i = 0; can_batch && i < tsc_spec.output_.count(); ++i) {
+        ObExpr *expr = tsc_spec.output_.at(i);
+        const bool is_fts_col = expr == fts_cols[0] || expr == fts_cols[1]
+            || expr == fts_cols[2] || expr == fts_cols[3];
+        if (!is_fts_col) {
+          can_batch = expr == tsc_spec.pdml_partition_id_
+              && T_PDML_PARTITION_ID == expr->type_ && expr->is_batch_result();
+          ++partition_cols;
+        }
+      }
+      can_batch = can_batch && partition_cols == tsc_spec.output_.count() - 4;
+      if (can_batch) {
+        tsc_spec.max_batch_size_ = phy_plan_->get_batch_size();
+        LOG_INFO("FTS DDL document batching enabled", K(tsc_spec.max_batch_size_), K(tsc_spec.is_fts_index_aux_));
+      }
+    }
+    const int64_t das_batch_size = tsc_spec.is_fts_ddl_ ? 0 : tsc_spec.max_batch_size_;
+    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, das_batch_size))) {
     } else if (lookup_ctdef != nullptr &&
-        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
-    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, das_batch_size))) {
+    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, das_batch_size))) {
     }
   }
 
@@ -5511,6 +5705,11 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
   } else {
     spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
     spec.value_expr_ = value_expr;
+    const TableItem *file_table = op.get_stmt()->get_table_item_by_id(op.get_table_id());
+    if (file_table != nullptr && !file_table->file_sql_descriptor_.empty()) {
+      OZ (ob_write_string(alloc, file_table->file_sql_descriptor_, spec.file_sql_descriptor_));
+      OZ (spec.file_sql_column_indices_.init(op.get_stmt()->get_column_size()));
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {
       }
@@ -5526,6 +5725,9 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
+        if (!spec.file_sql_descriptor_.empty()) {
+          OZ (spec.file_sql_column_indices_.push_back(col_item->column_id_ - OB_APP_MIN_COLUMN_ID));
+        }
       }
     }
   }
@@ -6117,6 +6319,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_FUNCTION_TABLE: {
       type = PHY_FUNCTION_TABLE;
+      const auto &file_op = static_cast<const ObLogFunctionTable &>(log_op);
+      const TableItem *table = log_op.get_stmt() == nullptr ? nullptr
+          : log_op.get_stmt()->get_table_item_by_id(file_op.get_table_id());
+      if (table != nullptr && !table->file_sql_descriptor_.empty()) { type = PHY_FILE_SQL_TABLE; }
       break;
     }
     case log_op_def::LOG_JSON_TABLE: {

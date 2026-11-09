@@ -132,6 +132,27 @@ public:
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
+  bool supports_owned_doc_id_span() const;
+  // A span borrows this iterator's owned copies, not the shared expression frame.
+  // It remains valid until this iterator reloads, reuses, or resets its buffer.
+  void get_owned_doc_id_span(const ObDocIdExt *&ids, int64_t &count) const
+  {
+    count = cur_idx_ >= 0 && cur_idx_ < count_ ? count_ - cur_idx_ : 0;
+    ids = count > 0 ? &doc_id_[cur_idx_] : nullptr;
+  }
+  int consume_owned_doc_id_prefix(const int64_t count)
+  {
+    int ret = OB_SUCCESS;
+    if (IS_NOT_INIT) {
+      ret = OB_NOT_INIT;
+    } else if (cur_idx_ < 0 || count <= 0 || count > count_ - cur_idx_) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      // cur_idx_ is now the next unconsumed row; reload only at buffer end.
+      cur_idx_ += count;
+    }
+    return ret;
+  }
 public:
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {

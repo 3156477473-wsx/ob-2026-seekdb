@@ -98,7 +98,7 @@ OB_DEF_SERIALIZE(ObDASIRScanCtDef)
     OB_UNIS_ENCODE(avg_doc_len_est_spec_);
   }
   LST_DO_CODE(OB_UNIS_ENCODE,
-    avg_doc_token_cnt_expr_);
+    avg_doc_token_cnt_expr_, union_count_output_);
   return ret;
 }
 
@@ -128,7 +128,7 @@ OB_DEF_DESERIALIZE(ObDASIRScanCtDef)
     OB_UNIS_DECODE(avg_doc_len_est_spec_);
   }
   LST_DO_CODE(OB_UNIS_DECODE,
-    avg_doc_token_cnt_expr_);
+    avg_doc_token_cnt_expr_, union_count_output_);
   return ret;
 }
 
@@ -157,7 +157,7 @@ OB_DEF_SERIALIZE_SIZE(ObDASIRScanCtDef)
     OB_UNIS_ADD_LEN(avg_doc_len_est_spec_);
   }
   LST_DO_CODE(OB_UNIS_ADD_LEN,
-    avg_doc_token_cnt_expr_);
+    avg_doc_token_cnt_expr_, union_count_output_);
   return len;
 }
 

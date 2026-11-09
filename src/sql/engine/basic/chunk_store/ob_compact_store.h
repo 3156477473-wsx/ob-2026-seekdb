@@ -64,6 +64,11 @@ public:
   int add_row(const common::ObIArray<ObExpr *> &exprs, ObEvalCtx &ctx, ObChunkDatumStore::StoredRow **stored_row = nullptr);
   int add_row(const ObChunkDatumStore::StoredRow &src_sr, ObChunkDatumStore::StoredRow **dst_sr = nullptr);
   int get_next_row(const ObChunkDatumStore::StoredRow *&sr);
+  // No source row/cursor is consumed until its borrowed values are owned by
+  // the destination. A declined layout can still use get_next_row unchanged.
+  int peek_fts_datums(common::ObDatum *datums, const int64_t count,
+                      int64_t &row_size, bool &supported);
+  void consume_fts_row(const int64_t row_size);
 
   int finish_write();
   // for ChunkSliceStore, get the last row to split range.

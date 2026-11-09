@@ -536,8 +536,16 @@ int ObTransformerImpl::choose_rewrite_rules(ObDMLStmt *stmt, uint64_t &need_type
   } else if (OB_FAIL(check_stmt_functions(stmt, func))) {
   } else if (OB_FAIL(check_temp_table_functions(stmt, func))) {
   } else {
-    if (func.contain_geometry_values_ || func.contain_fulltext_search_ || func.contain_vec_index_approx_) {
+    if (func.contain_geometry_values_ || func.contain_vec_index_approx_) {
       disable_list = ObTransformRule::ALL_TRANSFORM_RULES;
+    } else if (func.contain_fulltext_search_) {
+      disable_list = ObTransformRule::ALL_TRANSFORM_RULES;
+      if (ObTransformSimplifyOrderby::is_count_over_limited_fts_view(*stmt)) {
+        uint64_t enabled_types = 0;
+        ObTransformRule::add_trans_type(enabled_types, SIMPLIFY_ORDERBY);
+        ObTransformRule::add_trans_type(enabled_types, PROJECTION_PRUNING);
+        disable_list &= ~enabled_types;
+      }
     }
     if (func.contain_enum_set_values_) {
       uint64_t enum_set_enable_list = 0;

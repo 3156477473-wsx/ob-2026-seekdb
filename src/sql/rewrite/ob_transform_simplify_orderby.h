@@ -36,6 +36,8 @@ public:
                                  ObDMLStmt *&stmt,
                                  bool &trans_happened) override;
 
+  static bool is_count_over_limited_fts_view(const ObDMLStmt &stmt);
+
   int remove_order_by_for_subquery(ObDMLStmt *stmt, bool &trans_happened);
 
   int remove_order_by_for_view_stmt(ObDMLStmt *stmt, bool &trans_happened, bool &force_serial_set_order);

@@ -343,6 +343,8 @@ public:
                 const int64_t size);
 
   int add_stored_row(const ObChunkDatumStore::StoredRow &input_row);
+  // Synchronous deep-copy of the qualified FTS compact-row view.
+  int add_fts_datums(const common::ObDatum *datums, const int64_t count);
 
   virtual int sort();
 
@@ -400,6 +402,7 @@ public:
   bool is_inited() const { return inited_; }
   bool is_topn_sort() const { return INT64_MAX != topn_cnt_; }
 
+  bool enable_fts_term_rank_sort();
   void set_input_rows(int64_t input_rows) { input_rows_ = input_rows; }
   void set_input_width(int64_t input_width) { input_width_ = input_width; }
   void set_operator_type(ObPhyOperatorType op_type) { op_type_ = op_type; }
@@ -712,9 +715,30 @@ protected:
   // Based on this, see if we should consider adopting this approach uniformly, which is to use two parts: data size and total mem used size to determine whether to dump
   bool need_dump()
   {
-    return sql_mem_processor_.get_data_size() > sql_mem_processor_.get_mem_bound()
-        || mem_context_->used() >= profile_.get_max_bound();
+    int64_t scratch = fts_term_rank_scratch_size();
+    const int64_t data_bound = sql_mem_processor_.get_mem_bound();
+    const int64_t total_bound = profile_.get_max_bound();
+    const int64_t used = mem_context_->used();
+    // expect_size may be the one-pass data target, not the total memory grant.
+    // Keep one further store block ahead of the existing scratch cushion: this
+    // predicate is checked before the next row, after the last allocation.
+    const int64_t ahead = ObChunkDatumStore::BLOCK_SIZE;
+    if (scratch > 0 && (scratch >= total_bound || ahead >= total_bound - scratch)) {
+      // An unusable grant must not turn the reserve into repeated tiny dumps.
+      fts_term_rank_sort_ = false;
+      LOG_INFO("FTS term rank fallback", "reason", "reserve exceeds grant",
+          K(scratch), K(data_bound), K(total_bound), K(used));
+      scratch = 0;
+    }
+    return sql_mem_processor_.get_data_size() > data_bound
+        || used >= total_bound
+        || (scratch > 0 && used > total_bound - scratch - ahead);
   }
+  // Pointers borrow only the pinned StoredRows of the current run.
+  struct FtsRankRow { ObChunkDatumStore::StoredRow *row_; uint64_t term_; };
+  struct FtsRankTerm { const common::ObDatum *word_; uint64_t rank_; };
+  int64_t fts_term_rank_scratch_size() const;
+  int try_fts_term_rank_sort(bool &sorted);
   int preprocess_dump(bool &dumped);
   // before add row process: update date used memory, try dump ...
   int before_add_row();
@@ -821,6 +845,8 @@ protected:
   bool got_first_row_;
   bool sorted_;
   bool enable_encode_sortkey_;
+  bool fts_term_rank_sort_;
+  int64_t fts_word_key_;
   ModulePageAllocator page_allocator_;
   lib::MemoryContext mem_context_;
   MemEntifyFreeGuard mem_entify_guard_;

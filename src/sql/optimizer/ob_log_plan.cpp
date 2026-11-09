@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "config_bridge.h"
 #include "ob_log_plan.h"
+#include "sql/engine/basic/file_sql_bridge.h"
 #include "sql/optimizer/ob_pwj_comparer.h"
 #include "sql/optimizer/stat/ob_opt_stat_manager.h"
 #include "sql/optimizer/ob_log_table_scan.h"
@@ -4533,6 +4534,51 @@ int ObLogPlan::create_scala_group_plan(const ObIArray<ObAggFunRawExpr*> &aggr_it
   return ret;
 }
 
+namespace
+{
+int check_fts_union_count_pushdown(ObLogPlan &plan, ObLogTableScan &scan,
+    const ObIArray<ObAggFunRawExpr *> &aggrs, const ObIArray<ObRawExpr *> &groups,
+    bool &eligible)
+{
+  int ret = OB_SUCCESS;
+  eligible = false;
+  const ObDMLStmt *stmt = plan.get_stmt();
+  // seekdb's compatibility modes contain only MYSQL (and INVALID).
+  if (nullptr == stmt || !stmt->is_select_stmt()
+      || !stmt->is_single_table_stmt() || stmt->has_for_update()
+      || !groups.empty() || aggrs.count() != 1 || nullptr == aggrs.at(0)
+      || aggrs.at(0)->get_expr_type() != T_FUN_COUNT
+      || aggrs.at(0)->is_param_distinct() || aggrs.at(0)->get_real_param_count() != 0
+      || !scan.is_text_retrieval_scan() || scan.get_index_back() || scan.get_is_index_global()
+      || scan.has_func_lookup() || scan.has_es_match() || scan.has_merge_fts_index() || scan.use_index_merge()
+      || scan.is_vec_idx_scan() || scan.is_sample_scan() || scan.get_parallel() != 1
+      || !scan.get_filter_exprs().empty() || !scan.get_pushdown_filter_exprs().empty()
+      || !scan.get_startup_exprs().empty()
+      || nullptr != scan.get_limit_expr() || nullptr != scan.get_offset_expr()) return ret;
+  const ObSelectStmt &query = *static_cast<const ObSelectStmt *>(stmt);
+  const ObTextRetrievalInfo &tr = scan.get_text_retrieval_info();
+  if (query.is_distinct() || !query.get_group_exprs().empty() || !query.get_having_exprs().empty()
+      || !query.get_order_items().empty() || nullptr != query.get_limit_expr()
+      || nullptr != query.get_offset_expr() || query.get_select_item_size() != 1
+      || query.get_select_item(0).expr_ != aggrs.at(0)
+      || nullptr == tr.match_expr_ || tr.match_expr_->get_mode_flag() != NATURAL_LANGUAGE_MODE
+      || tr.need_calc_relevance_ || nullptr != tr.pushdown_match_filter_ || tr.need_sort()
+      || nullptr != tr.topk_limit_expr_ || nullptr != tr.topk_offset_expr_ || tr.with_ties_) return ret;
+  const ObTableSchema *table = nullptr;
+  ObSchemaGetterGuard *guard = plan.get_optimizer_context().get_schema_guard();
+  if (nullptr == guard) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(guard->get_table_schema(scan.get_real_ref_table_id(), table))) {
+  } else if (nullptr == table) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // Each partial must see all tokens over one complete, non-overlapping document domain.
+    eligible = !table->is_partitioned_table();
+  }
+  return ret;
+}
+} // namespace
+
 int ObLogPlan::try_push_aggr_into_table_scan(ObLogicalOperator *top,
                                              const ObIArray<ObAggFunRawExpr *> &aggr_items,
                                              const ObIArray<ObRawExpr*> &groupby_columns)
@@ -4544,12 +4590,15 @@ int ObLogPlan::try_push_aggr_into_table_scan(ObLogicalOperator *top,
     ObLogTableScan *scan_op = static_cast<ObLogTableScan*>(top);
     bool is_get = false;
     bool has_npd_filter = false; //has non-pushdown filter
+    bool fts_union_count = false;
     if (OB_FAIL(scan_op->is_table_get(is_get))) {
     } else if (OB_FAIL(scan_op->has_nonpushdown_filter(has_npd_filter))) {
+    } else if (scan_op->is_text_retrieval_scan()
+        && OB_FAIL(check_fts_union_count_pushdown(*this, *scan_op, aggr_items, groupby_columns, fts_union_count))) {
     } else if (is_get ||
                has_npd_filter ||
                scan_op->get_index_back() ||
-               scan_op->is_text_retrieval_scan() ||
+               (scan_op->is_text_retrieval_scan() && !fts_union_count) ||
                scan_op->is_sample_scan() ||
                (scan_op->is_index_scan() && !groupby_columns.empty()) ||
                (is_descending_direction(scan_op->get_scan_direction()) && !groupby_columns.empty())) {
@@ -6829,10 +6878,28 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_buffer_size(into_item->buffer_size_);
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
-      select_into->set_external_properties(into_item->external_properties_);
+      if (filesql::is_copy_descriptor(into_item->external_properties_)) {
+        filesql::ScanDefinition copy;
+        ObString encoded;
+        if (OB_FAIL(filesql::decode_scan(into_item->external_properties_, copy))) {
+        } else {
+          copy.columns.clear();
+          for (int64_t i = 0; i < stmt->get_select_item_size(); ++i) {
+            const SelectItem &item = stmt->get_select_item(i);
+            const ObString &name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
+            filesql::Column column;
+            column.name.assign(name.ptr() == nullptr ? "" : name.ptr(), name.length());
+            copy.columns.push_back(std::move(column));
+          }
+          if (OB_FAIL(filesql::encode_scan(copy, get_allocator(), encoded))) {
+          } else { select_into->set_external_properties(encoded); }
+        }
+      } else {
+        select_into->set_external_properties(into_item->external_properties_);
+      }
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
-      if (OB_FAIL(select_into->compute_property())) {
+      if (OB_SUCC(ret) && OB_FAIL(select_into->compute_property())) {
       } else {
         old_top = select_into;
       }
@@ -11987,6 +12054,87 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// A natural-language match has a strictly positive BM25 contribution for every
+// visible posting (the IDF is clamped to a positive epsilon). When the match is
+// used only as a positive WHERE conjunct, merging document IDs is sufficient.
+// Keep scored, Boolean, correlated, and hybrid retrieval on the existing path.
+static int check_predicate_only_text_match(ObExecContext *exec_ctx,
+                                          const ObDMLStmt *stmt,
+                                          ObMatchFunRawExpr *match_expr,
+                                          bool &predicate_only,
+                                          ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  predicate_only = false;
+  if (OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!stmt->is_select_stmt() || stmt->get_table_size() != 1
+      || OB_ISNULL(stmt->get_table_item(0)) || !stmt->get_table_item(0)->is_basic_table()
+      || !stmt->get_subquery_exprs().empty() || stmt->get_match_exprs().count() != 1
+      || nullptr != stmt->get_first_vector_expr()
+      || NATURAL_LANGUAGE_MODE != match_expr->get_mode_flag()
+      || !match_expr->get_columns_boosts().empty()
+      || match_expr->is_es_match() || nullptr != match_expr->get_param_text_expr()
+      || stmt->is_contains_assignment()
+      || static_cast<const ObSelectStmt *>(stmt)->has_for_update()
+      || static_cast<const ObSelectStmt *>(stmt)->has_select_into()
+      || OB_ISNULL(match_expr->get_search_key())
+      || !match_expr->get_search_key()->is_static_const_expr()) {
+    // This initial optimization deliberately excludes other retrieval modes.
+  } else {
+    bool has_other_use = false;
+    bool has_positive_filter = false;
+    ObSEArray<ObRawExpr *, 16> other_exprs;
+    ObStmtExprGetter getter;
+    getter.set_relation_scope();
+    getter.remove_scope(SCOPE_WHERE);
+    getter.set_recursive(false);
+    if (OB_FAIL(stmt->get_relation_exprs(other_exprs, getter))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !has_other_use && i < other_exprs.count(); ++i) {
+      if (OB_FAIL(ObRawExprUtils::find_expr(other_exprs.at(i), match_expr, has_other_use))) {
+      } else if (other_exprs.at(i)->has_flag(CNT_DYNAMIC_PARAM)) {
+        has_other_use = true;
+      }
+    }
+    // Inspect WHERE separately: an expression shared by SELECT and WHERE must
+    // remain scored even if both scopes happen to reference the same root.
+    const ObIArray<ObRawExpr *> &filters = stmt->get_condition_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && !has_other_use && i < filters.count(); ++i) {
+      ObRawExpr *expr = filters.at(i);
+      bool contains_match = false;
+      bool is_positive_filter = false;
+      ObRawExpr *zero_expr = nullptr;
+      if (OB_FAIL(ObRawExprUtils::find_expr(expr, match_expr, contains_match))) {
+      } else if (expr->has_flag(CNT_DYNAMIC_PARAM)) {
+        has_other_use = true;
+      } else if (!contains_match) {
+        // Other conjuncts are still evaluated by the normal scan filters.
+      } else if (expr == match_expr
+          || (T_OP_BOOL == expr->get_expr_type() && expr->get_param_count() == 1
+              && expr->get_param_expr(0) == match_expr)) {
+        is_positive_filter = true;
+      } else if (expr->get_param_count() == 2) {
+        if (T_OP_GT == expr->get_expr_type() && expr->get_param_expr(0) == match_expr) {
+          zero_expr = expr->get_param_expr(1);
+        } else if (T_OP_LT == expr->get_expr_type() && expr->get_param_expr(1) == match_expr) {
+          zero_expr = expr->get_param_expr(0);
+        }
+        if (nullptr != zero_expr && zero_expr->get_result_type().is_numeric_type()
+            && OB_FAIL(ObTransformUtils::check_expr_eq_zero(exec_ctx, zero_expr,
+                                                           is_positive_filter, constraints))) {
+        }
+      }
+      if (OB_SUCC(ret) && contains_match) {
+        has_positive_filter |= is_positive_filter;
+        has_other_use |= !is_positive_filter;
+      }
+    }
+    predicate_only = OB_SUCC(ret) && has_positive_filter && !has_other_use;
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12039,12 +12187,30 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    bool predicate_only = false;
+    ObSEArray<ObExprConstraint, 2> constraints;
+    if (1 != scan_match_filters.count() || 1 != all_match_filters.count()
+        || table_scan->is_vec_idx_scan() || table_scan->get_index_back()) {
+      // Keep the existing lookup-iterator contract for scans that need index
+      // back; this initial optimization only supports covering retrieval.
+      // Additional match filters and vector retrieval also keep score output.
+    } else if (OB_FAIL(check_predicate_only_text_match(get_optimizer_context().get_exec_ctx(),
+                                                       get_stmt(), match_against,
+                                                       predicate_only, constraints))) {
+    } else if (predicate_only && OB_FAIL(append_array_no_dup(
+        get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
+    } else if (predicate_only) {
+      tr_info.need_calc_relevance_ = false;
+      // The postings union enforces this predicate; no score consumer remains.
+      tr_info.pushdown_match_filter_ = nullptr;
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
       table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
     }
-    if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
     } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
     }
   }
