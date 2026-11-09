@@ -40,9 +40,6 @@ public:
 
   int init();
   int reset_resource();
-  // 跨调用复用解析器时：重新绑定到新文档，复用 ctx 对象与其分配，
-  // 避免每次 TOKENIZE 都新建 ctx。
-  void rebind(const char *fulltext, int64_t fulltext_len);
 
   int get_next_token(const char *&word, int64_t &word_len, int64_t &offset, int64_t &char_cnt);
 
@@ -111,10 +108,6 @@ public:
                          const uint8_t char_len,
                          const ObFTCharUtil::CharType type)
       = 0;
-
-  // 复用解析器跨文档分词时，重置处理器内部积累的跨调用状态
-  //（如连续数字的 start/end 游标、未结算的词典命中）。
-  virtual void reset() {}
 };
 
 } // namespace storage

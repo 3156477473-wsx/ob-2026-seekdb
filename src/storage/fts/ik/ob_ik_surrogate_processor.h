@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2025 OceanBase.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,7 @@ public:
                  const ObFTCharUtil::CharType type) override;
 
 private:
-  void reset() override
+  void reset()
   {
     low_offset_ = -1;
     high_offset_ = -1;

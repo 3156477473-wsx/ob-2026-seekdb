@@ -130,21 +130,6 @@ int TokenizeContext::reset_resource()
   return OB_SUCCESS;
 }
 
-void TokenizeContext::rebind(const char *fulltext, int64_t fulltext_len)
-{
-  fulltext_ = fulltext;
-  fulltext_len_ = fulltext_len;
-  cursor_ = 0;
-  next_char_len_ = 0;
-  handle_size_ = 0;
-  result_list_.reset();
-  token_list_.reset();
-  // 与 init() 一致：预先解析游标处第一个字符，供 current_char/type 使用。
-  if (OB_NOT_NULL(fulltext_) && fulltext_len_ > 0) {
-    (void)prepare_next_char();
-  }
-}
-
 int TokenizeContext::current_char(const char *&ch, uint8_t &char_len)
 {
   int ret = OB_SUCCESS;

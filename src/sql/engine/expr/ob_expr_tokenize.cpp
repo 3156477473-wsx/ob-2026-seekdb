@@ -190,6 +190,53 @@ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
 
 ObExprTokenize::~ObExprTokenize() {}
 
+namespace
+{
+// TOKENIZE 结果的输入级缓存。
+//
+// TOKENIZE 的输出完全由（解析器名、解析器属性、排序规则、输出模式、全文）决定，
+// 因此同一组输入可以安全复用上一次的序列化结果，省掉重复的分词与编码。
+// 缓存按字段内容逐一精确比对，任何一项不同都回退到完整计算路径；
+// 条目定长、线程私有，不引入额外的堆分配与锁，也不跨线程共享。
+struct ObTokenizeCacheEntry
+{
+  static constexpr int64_t MAX_PARSER = 64;
+  static constexpr int64_t MAX_PROPS = 128;
+  static constexpr int64_t MAX_TEXT = 256;
+  static constexpr int64_t MAX_VALUE = 4096;
+  char parser_[MAX_PARSER];
+  char props_[MAX_PROPS];
+  char text_[MAX_TEXT];
+  char value_[MAX_VALUE];
+  int32_t parser_len_;
+  int32_t props_len_;
+  int32_t text_len_;
+  int32_t value_len_;
+  int32_t cs_;
+  int32_t mode_;
+  bool valid_;
+};
+
+struct ObTokenizeCache
+{
+  static constexpr int64_t SLOTS = 4;
+  ObTokenizeCacheEntry slots_[SLOTS];
+  int64_t next_;
+  ObTokenizeCache() : next_(0)
+  {
+    for (int64_t i = 0; i < SLOTS; ++i) {
+      slots_[i].valid_ = false;
+    }
+  }
+};
+
+ObTokenizeCache &tokenize_cache()
+{
+  static thread_local ObTokenizeCache cache;
+  return cache;
+}
+} // namespace
+
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
@@ -204,12 +251,66 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else {
+    ObTokenizeCache &cache = tokenize_cache();
+    const int32_t cs = static_cast<int32_t>(param.meta_.get_collation_type());
+    const int32_t mode = static_cast<int32_t>(param.output_mode_);
+    const ObString &parser = param.parser_name_;
+    const ObString &props = param.properties_;
+    const ObString &text = param.fulltext_;
+    bool hit = false;
+    ObString hit_value;
+    for (int64_t i = 0; i < ObTokenizeCache::SLOTS && !hit; ++i) {
+      const ObTokenizeCacheEntry &e = cache.slots_[i];
+      if (e.valid_ && e.cs_ == cs && e.mode_ == mode
+          && e.parser_len_ == parser.length()
+          && (0 == e.parser_len_ || 0 == MEMCMP(e.parser_, parser.ptr(), e.parser_len_))
+          && e.props_len_ == props.length()
+          && (0 == e.props_len_ || 0 == MEMCMP(e.props_, props.ptr(), e.props_len_))
+          && e.text_len_ == text.length()
+          && (0 == e.text_len_ || 0 == MEMCMP(e.text_, text.ptr(), e.text_len_))) {
+        hit = true;
+        hit_value.assign_ptr(e.value_, e.value_len_);
+      }
+    }
+
+    if (hit) {
+      ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, hit_value);
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else if (parser.length() <= ObTokenizeCacheEntry::MAX_PARSER
+               && props.length() <= ObTokenizeCacheEntry::MAX_PROPS
+               && text.length() <= ObTokenizeCacheEntry::MAX_TEXT
+               && OB_NOT_NULL(json_result)) {
+      // 命中未果时尽力缓存本次结果；提取失败不影响本次返回。
+      ObString raw;
+      if (OB_SUCC(ObJsonWrapper::get_raw_binary(json_result, raw, &temp_allocator))
+          && raw.length() > 0 && raw.length() <= ObTokenizeCacheEntry::MAX_VALUE) {
+        ObTokenizeCacheEntry &e = cache.slots_[cache.next_];
+        cache.next_ = (cache.next_ + 1) % ObTokenizeCache::SLOTS;
+        e.parser_len_ = static_cast<int32_t>(parser.length());
+        e.props_len_ = static_cast<int32_t>(props.length());
+        e.text_len_ = static_cast<int32_t>(text.length());
+        e.value_len_ = static_cast<int32_t>(raw.length());
+        e.cs_ = cs;
+        e.mode_ = mode;
+        if (e.parser_len_ > 0) {
+          MEMCPY(e.parser_, parser.ptr(), e.parser_len_);
+        }
+        if (e.props_len_ > 0) {
+          MEMCPY(e.props_, props.ptr(), e.props_len_);
+        }
+        if (e.text_len_ > 0) {
+          MEMCPY(e.text_, text.ptr(), e.text_len_);
+        }
+        MEMCPY(e.value_, raw.ptr(), e.value_len_);
+        e.valid_ = true;
+      }
+    }
   }
 
   return ret;
