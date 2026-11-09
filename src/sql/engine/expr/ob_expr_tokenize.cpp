@@ -288,7 +288,7 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
                && OB_NOT_NULL(json_result)) {
       // 命中未果时尽力缓存本次结果；提取失败不影响本次返回。
       ObString raw;
-      if (OB_SUCC(ObJsonWrapper::get_raw_binary(json_result, raw, &temp_allocator))
+      if (OB_SUCC(share::ObJsonWrapper::get_raw_binary(json_result, raw, &temp_allocator))
           && raw.length() > 0 && raw.length() <= ObTokenizeCacheEntry::MAX_VALUE) {
         ObTokenizeCacheEntry &e = cache.slots_[cache.next_];
         cache.next_ = (cache.next_ + 1) % ObTokenizeCache::SLOTS;
