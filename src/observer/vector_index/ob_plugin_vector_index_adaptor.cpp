@@ -2530,7 +2530,7 @@ int ObPluginVectorIndexAdaptor::check_index_id_table_readnext_status(ObVectorQue
   } else if (!is_async_mode) {
     // Original logic: non-async mode (sync mode or non-heap table: no incremental path)
     if (check_if_complete_index(read_scn) &&
-        OB_FAIL(complete_index_mem_data(read_scn, row_iter, datum_row, i_vids))) {
+        OB_FAIL(complete_index_mem_data(read_scn, row_iter, datum_row, i_vids, ctx))) {
       LOG_WARN("failed to check comple index mem data.", K(ret), K(read_scn), K(vbitmap_data_->scn_));
     } else if (OB_ISNULL(ctx->bitmaps_) || OB_ISNULL(ctx->bitmaps_->insert_bitmap_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -2856,8 +2856,10 @@ int ObPluginVectorIndexAdaptor::add_datum_row_into_array(blocksstable::ObDatumRo
 int ObPluginVectorIndexAdaptor::complete_index_mem_data(SCN read_scn,
                                                         common::ObNewRowIterator *row_iter,
                                                         blocksstable::ObDatumRow *last_row,
-                                                        ObArray<uint64_t> &i_vids)
+                                                        ObArray<uint64_t> &i_vids,
+                                                        ObVectorQueryAdaptorResultContext *ctx)
 {
+  UNUSED(ctx);
   INIT_SUCC(ret);
   int64_t dim = 0;
   ObArray<uint64_t> d_vids;
@@ -3111,7 +3113,7 @@ int ObPluginVectorIndexAdaptor::refresh_bitmap_background()
   ObVectorQueryAdaptorResultContext ctx(0, &tmp_alloc, &tmp_alloc);
   ObArray<uint64_t> i_vids;
   share::SCN snapshot_scn;
-  const int64_t DEFAULT_TIMEOUT = GCONF.internal_sql_execute_timeout;
+  const int64_t DEFAULT_TIMEOUT = config::internal_sql_execute_timeout();
   transaction::ObTransService *txs = ::oceanbase::share::server_service<::oceanbase::transaction::ObTransService>();
   ObTimeoutCtx timeout_ctx;
   if (OB_ISNULL(txs)) {
