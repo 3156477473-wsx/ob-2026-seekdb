@@ -466,12 +466,48 @@ int construct(cuvsResources_t res, cuvsCagraIndexParams_t params, DLManagedTenso
   ivf.build->n_lists = std::max(1u, rows / 2000u);
   ivf.build->kmeans_n_iters = 10;
   const double minimum_fraction = std::min(1.0, 32.0 * ivf.build->n_lists / rows64);
-  ivf.build->kmeans_trainset_fraction = std::clamp(1.0 / std::sqrt(rows64 * 1e-5), minimum_fraction, 1.0);
+  // Coarse-quantizer training set.
+  //
+  // What kmeans actually needs is a bounded number of samples per centroid --
+  // the classical rule of thumb is a few hundred, and past that the centroids
+  // stop moving measurably while the cost of every iteration keeps growing
+  // with the sample count. Sizing the training set from the number of lists
+  // keeps that ratio fixed across dataset sizes, instead of training on most
+  // or all of the table for small and medium inputs.
+  //
+  // Keep the previous behaviour as an upper bound so this can only ever make
+  // training cheaper, never expand it.
+  const double samples_per_list = 256.0;
+  const double bounded_fraction =
+      std::min(1.0, samples_per_list * double(ivf.build->n_lists) / double(rows64));
+  const double previous_fraction =
+      std::clamp(1.0 / std::sqrt(rows64 * 1e-5), minimum_fraction, 1.0);
+  ivf.build->kmeans_trainset_fraction =
+      std::max(minimum_fraction, std::min(previous_fraction, bounded_fraction));
   ivf.build->pq_bits = dim <= 32 ? 8 : 4;
   ivf.build->pq_dim = dim <= 32 ? unsigned(std::min<int64_t>(dim, 16)) :
       dim <= 64 ? 32 : dim <= 128 ? 64 : dim <= 192 ? 96 : unsigned(((dim / 2 + 127) / 128) * 128);
   ivf.build->codebook_kind = PER_SUBSPACE;
-  ivf.search->n_probes = std::min(unsigned(SEEKDB_IVFPQ_PROBES), ivf.build->n_lists);
+  // Probe budget.
+  //
+  // n_lists grows with the dataset (rows / 2000), so a constant probe count
+  // covers a steadily smaller share of the index as N grows: at 250K rows it
+  // is 16 of 125 lists, and at 4x that it is still 16 of 500. Below a fixed
+  // floor we would start losing candidates that a full scan of the coarse
+  // quantizer would have found, which shows up as recall loss rather than as
+  // a visible error.
+  //
+  // Keep the configured constant as the floor (so small and medium datasets
+  // behave exactly as before) and only grow past it once n_lists exceeds
+  // 8x the floor, holding the probed share at about 1/8 of the lists. The
+  // upper bound keeps build cost from climbing without limit on very large
+  // inputs.
+  const unsigned probe_floor = unsigned(SEEKDB_IVFPQ_PROBES);
+  const unsigned probe_share = (ivf.build->n_lists + 7u) / 8u;
+  const unsigned probe_cap = 48u;
+  const unsigned probe_budget =
+      std::min(std::max(probe_floor, probe_share), probe_cap);
+  ivf.search->n_probes = std::min(probe_budget, ivf.build->n_lists);
   ivf.search->lut_dtype = HIP_R_32F;
   ivf.search->internal_distance_dtype = HIP_R_32F;
   ivf.search->coarse_search_dtype = HIP_R_32F;
