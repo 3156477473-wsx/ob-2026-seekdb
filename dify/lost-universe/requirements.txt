@@ -1,0 +1,3 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+PyMySQL==1.1.1

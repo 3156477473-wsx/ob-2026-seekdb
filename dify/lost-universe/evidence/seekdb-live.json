@@ -1,0 +1,92 @@
+{
+  "database": {
+    "version": "5.7.25-OceanBase seekdb-v1.4.0.0"
+  },
+  "player": "verify_c11ed8fbd0a5",
+  "turns": [
+    [
+      "开始",
+      {
+        "event": "新一轮开始。欢迎来到月球失物招领所。柜台上躺着一把正在下雨的伞。候选主人：修理机器人阿锈、月球园丁小满、云朵邮差白羽。输入「线索」调查，或「归还 姓名」认领。",
+        "state": {
+          "clues": 0,
+          "done": false
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "线索",
+      {
+        "event": "伞柄贴着标签：禁止用于遮雨，本设备只负责制造雨。",
+        "state": {
+          "clues": 1,
+          "done": false
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "归还 白羽",
+      {
+        "event": "认领失败，物品拒绝跟此人离开。再找一条线索吧。",
+        "state": {
+          "clues": 1,
+          "done": false
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "线索",
+      {
+        "event": "伞面夹着一片薄荷叶，旁边写着：月球第三温室，周二浇水。",
+        "state": {
+          "clues": 2,
+          "done": false
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "归还 小满",
+      {
+        "event": "归还成功！获得 2 颗星。小满接过雨伞，月球上第一杯薄荷茶终于有了着落。你获得称号：银河送伞人。",
+        "state": {
+          "clues": 2,
+          "done": true
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "线索",
+      {
+        "event": "本轮已结束。输入「开始」重新挑战。",
+        "state": {
+          "clues": 2,
+          "done": true
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ],
+    [
+      "开始",
+      {
+        "event": "新一轮开始。欢迎来到月球失物招领所。柜台上躺着一把正在下雨的伞。候选主人：修理机器人阿锈、月球园丁小满、云朵邮差白羽。输入「线索」调查，或「归还 姓名」认领。",
+        "state": {
+          "clues": 0,
+          "done": false
+        },
+        "source": "seekdb/lost_cases/moon",
+        "rule": "只渲染event，不添加线索、人物事实、分数或成功判定。"
+      }
+    ]
+  ]
+}
